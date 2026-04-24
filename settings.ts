@@ -3,12 +3,10 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentConfig } from "./agents.js";
-import { normalizeSkillInput } from "./skills.js";
-
-const CHAIN_RUNS_DIR = path.join(os.tmpdir(), "pi-chain-runs");
+import type { AgentConfig } from "./agents.ts";
+import { normalizeSkillInput } from "./skills.ts";
+import { CHAIN_RUNS_DIR } from "./types.ts";
 const CHAIN_DIR_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // =============================================================================
@@ -52,6 +50,7 @@ export interface ParallelTaskItem {
 	agent: string;
 	task?: string;
 	cwd?: string;
+	count?: number;
 	output?: string | false;
 	reads?: string[] | false;
 	progress?: boolean;
@@ -64,6 +63,7 @@ export interface ParallelStep {
 	parallel: ParallelTaskItem[];
 	concurrency?: number;
 	failFast?: boolean;
+	worktree?: boolean;
 }
 
 /** Union type for chain steps */
@@ -98,7 +98,9 @@ export function createChainDir(runId: string, baseDir?: string): string {
 export function removeChainDir(chainDir: string): void {
 	try {
 		fs.rmSync(chainDir, { recursive: true });
-	} catch {}
+	} catch {
+		// Chain cleanup is best-effort. Runs can already have cleaned their temp dir.
+	}
 }
 
 export function cleanupOldChainDirs(): void {
@@ -108,6 +110,8 @@ export function cleanupOldChainDirs(): void {
 	try {
 		dirs = fs.readdirSync(CHAIN_RUNS_DIR);
 	} catch {
+		// Startup cleanup is best-effort. If the scoped temp root is unreadable,
+		// skip cleanup instead of failing extension startup.
 		return;
 	}
 
@@ -352,41 +356,5 @@ export function createParallelDirs(
 	}
 }
 
-/** Result from a parallel task (simplified for aggregation) */
-export interface ParallelTaskResult {
-	agent: string;
-	taskIndex: number;
-	output: string;
-	exitCode: number;
-	error?: string;
-	outputTargetPath?: string;
-	outputTargetExists?: boolean;
-}
-
-/**
- * Aggregate outputs from parallel tasks into a single string for {previous}.
- * Uses clear separators so the next agent can parse all outputs.
- */
-export function aggregateParallelOutputs(results: ParallelTaskResult[]): string {
-	return results
-		.map((r, i) => {
-			const header = `=== Parallel Task ${i + 1} (${r.agent}) ===`;
-			const hasTextOutput = Boolean(r.output?.trim());
-			const status = r.exitCode === -1
-				? "⏭️ SKIPPED"
-				: r.exitCode !== 0
-					? `⚠️ FAILED (exit code ${r.exitCode})${r.error ? `: ${r.error}` : ""}`
-					: r.error
-						? `⚠️ WARNING: ${r.error}`
-						: !hasTextOutput && r.outputTargetPath && r.outputTargetExists === false
-							? `⚠️ EMPTY OUTPUT (expected output file missing: ${r.outputTargetPath})`
-							: !hasTextOutput && !r.outputTargetPath
-								? "⚠️ EMPTY OUTPUT (no textual response returned)"
-								: "";
-			const body = status
-				? (hasTextOutput ? `${status}\n${r.output}` : status)
-				: r.output;
-			return `${header}\n${body}`;
-		})
-		.join("\n\n");
-}
+export type { ParallelTaskResult } from "./parallel-utils.ts";
+export { aggregateParallelOutputs } from "./parallel-utils.ts";

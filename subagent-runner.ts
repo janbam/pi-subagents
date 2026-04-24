@@ -1,20 +1,33 @@
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
-import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { appendJsonl, getArtifactPaths } from "./artifacts.js";
-import { getPiSpawnCommand } from "./pi-spawn.js";
-import { persistSingleOutput } from "./single-output.js";
+import type { Message } from "@mariozechner/pi-ai";
+import { appendJsonl, getArtifactPaths } from "./artifacts.ts";
+import { getPiSpawnCommand } from "./pi-spawn.ts";
+import { captureSingleOutputSnapshot, resolveSingleOutput } from "./single-output.ts";
 import {
+	type ActivityState,
 	type ArtifactConfig,
 	type ArtifactPaths,
+	type ModelAttempt,
+	type ResolvedControlConfig,
+	type Usage,
 	DEFAULT_MAX_OUTPUT,
 	type MaxOutputConfig,
 	truncateOutput,
 	getSubagentDepthEnv,
-} from "./types.js";
+} from "./types.ts";
+import {
+	DEFAULT_CONTROL_CONFIG,
+	buildControlEvent,
+	deriveActivityState,
+	claimControlNotification,
+	formatControlIntercomMessage,
+	formatControlNoticeMessage,
+	shouldEmitControlEvent,
+} from "./subagent-control.ts";
 import {
 	type RunnerSubagentStep as SubagentStep,
 	type RunnerStep,
@@ -23,7 +36,21 @@ import {
 	mapConcurrent,
 	aggregateParallelOutputs,
 	MAX_PARALLEL_CONCURRENCY,
-} from "./parallel-utils.js";
+} from "./parallel-utils.ts";
+import { buildPiArgs, cleanupTempDir } from "./pi-args.ts";
+import { formatModelAttemptNote, isRetryableModelFailure } from "./model-fallback.ts";
+import { attachPostExitStdioGuard, trySignalChild } from "./post-exit-stdio-guard.ts";
+import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "./utils.ts";
+import { parseSessionTokens, type TokenUsage } from "./session-tokens.ts";
+import {
+	cleanupWorktrees,
+	createWorktrees,
+	diffWorktrees,
+	findWorktreeTaskCwdConflict,
+	formatWorktreeDiffSummary,
+	formatWorktreeTaskCwdConflict,
+	type WorktreeSetup,
+} from "./worktree.ts";
 
 interface SubagentRunConfig {
 	id: string;
@@ -41,6 +68,12 @@ interface SubagentRunConfig {
 	asyncDir: string;
 	sessionId?: string | null;
 	piPackageRoot?: string;
+	piArgv1?: string;
+	worktreeSetupHook?: string;
+	worktreeSetupHookTimeoutMs?: number;
+	controlConfig?: ResolvedControlConfig;
+	controlIntercomTarget?: string;
+	childIntercomTargets?: Array<string | undefined>;
 }
 
 interface StepResult {
@@ -48,11 +81,15 @@ interface StepResult {
 	output: string;
 	success: boolean;
 	skipped?: boolean;
+	model?: string;
+	attemptedModels?: string[];
+	modelAttempts?: ModelAttempt[];
 	artifactPaths?: ArtifactPaths;
 	truncated?: boolean;
 }
 
 const require = createRequire(import.meta.url);
+const ASYNC_INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
 
 function findLatestSessionFile(sessionDir: string): string | null {
 	try {
@@ -64,37 +101,66 @@ function findLatestSessionFile(sessionDir: string): string | null {
 		files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
 		return files[0] ?? null;
 	} catch {
+		// Session lookup is optional metadata.
 		return null;
 	}
 }
 
-interface TokenUsage {
-	input: number;
-	output: number;
-	total: number;
+function emptyUsage(): Usage {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 }
 
-function parseSessionTokens(sessionDir: string): TokenUsage | null {
-	const sessionFile = findLatestSessionFile(sessionDir);
-	if (!sessionFile) return null;
-	try {
-		const content = fs.readFileSync(sessionFile, "utf-8");
-		let input = 0;
-		let output = 0;
-		for (const line of content.split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const entry = JSON.parse(line);
-				if (entry.usage) {
-					input += entry.usage.inputTokens ?? entry.usage.input ?? 0;
-					output += entry.usage.outputTokens ?? entry.usage.output ?? 0;
-				}
-			} catch {}
-		}
-		return { input, output, total: input + output };
-	} catch {
-		return null;
+function tokenUsageFromAttempts(attempts: ModelAttempt[] | undefined): TokenUsage | null {
+	if (!attempts || attempts.length === 0) return null;
+	let input = 0;
+	let output = 0;
+	for (const attempt of attempts) {
+		input += attempt.usage?.input ?? 0;
+		output += attempt.usage?.output ?? 0;
 	}
+	const total = input + output;
+	return total > 0 ? { input, output, total } : null;
+}
+
+interface ChildEventContext {
+	eventsPath: string;
+	runId: string;
+	stepIndex: number;
+	agent: string;
+}
+
+interface ChildUsage {
+	input?: number;
+	inputTokens?: number;
+	output?: number;
+	outputTokens?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	cost?: { total?: number };
+}
+
+type ChildMessage = Message & {
+	model?: string;
+	errorMessage?: string;
+	usage?: ChildUsage;
+};
+
+interface ChildEvent {
+	type?: string;
+	message?: ChildMessage;
+	toolName?: string;
+	args?: Record<string, unknown>;
+}
+
+interface RunPiStreamingResult {
+	stderr: string;
+	exitCode: number | null;
+	messages: Message[];
+	usage: Usage;
+	model?: string;
+	error?: string;
+	finalOutput: string;
+	interrupted?: boolean;
 }
 
 function runPiStreaming(
@@ -103,32 +169,205 @@ function runPiStreaming(
 	outputFile: string,
 	env?: Record<string, string | undefined>,
 	piPackageRoot?: string,
-): Promise<{ stdout: string; exitCode: number | null }> {
+	piArgv1?: string,
+	maxSubagentDepth?: number,
+	childEventContext?: ChildEventContext,
+	registerInterrupt?: (interrupt: (() => void) | undefined) => void,
+): Promise<RunPiStreamingResult> {
 	return new Promise((resolve) => {
 		const outputStream = fs.createWriteStream(outputFile, { flags: "w" });
-		const spawnEnv = { ...process.env, ...(env ?? {}), ...getSubagentDepthEnv() };
-		const spawnSpec = getPiSpawnCommand(args, piPackageRoot ? { piPackageRoot } : undefined);
+		const spawnEnv = { ...process.env, ...(env ?? {}), ...getSubagentDepthEnv(maxSubagentDepth) };
+		const spawnSpec = getPiSpawnCommand(args, {
+			...(piPackageRoot ? { piPackageRoot } : {}),
+			...(piArgv1 ? { argv1: piArgv1 } : {}),
+		});
 		const child = spawn(spawnSpec.command, spawnSpec.args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: spawnEnv });
-		let stdout = "";
+		let stderr = "";
+		let stdoutBuf = "";
+		let stderrBuf = "";
+		const messages: Message[] = [];
+		const usage = emptyUsage();
+		let model: string | undefined;
+		let error: string | undefined;
+		let interrupted = false;
+		const rawStdoutLines: string[] = [];
 
+		const writeOutputLine = (line: string) => {
+			if (!line.trim()) return;
+			outputStream.write(`${line}\n`);
+		};
+
+		const writeOutputText = (text: string) => {
+			for (const line of text.split("\n")) {
+				writeOutputLine(line);
+			}
+		};
+
+		const appendChildEvent = (event: Record<string, unknown>) => {
+			if (!childEventContext) return;
+			appendJsonl(childEventContext.eventsPath, JSON.stringify({
+				...event,
+				subagentSource: "child",
+				subagentRunId: childEventContext.runId,
+				subagentStepIndex: childEventContext.stepIndex,
+				subagentAgent: childEventContext.agent,
+				observedAt: Date.now(),
+			}));
+		};
+
+		const appendChildLine = (type: "subagent.child.stdout" | "subagent.child.stderr", line: string) => {
+			appendChildEvent({ type, line });
+		};
+
+		const processStdoutLine = (line: string) => {
+			if (!line.trim()) return;
+			let event: ChildEvent;
+			try {
+				event = JSON.parse(line) as ChildEvent;
+			} catch {
+				rawStdoutLines.push(line);
+				writeOutputLine(line);
+				appendChildLine("subagent.child.stdout", line);
+				return;
+			}
+
+			appendChildEvent(event);
+
+			if (event.type === "tool_execution_start" && event.toolName) {
+				const toolArgs = extractToolArgsPreview(event.args ?? {});
+				writeOutputLine(toolArgs ? `${event.toolName}: ${toolArgs}` : event.toolName);
+				return;
+			}
+
+			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
+				messages.push(event.message);
+				const text = extractTextFromContent(event.message.content);
+				if (text) writeOutputText(text);
+
+				if (event.type !== "message_end" || event.message.role !== "assistant") return;
+				if (event.message.model) model = event.message.model;
+				if (event.message.errorMessage) error = event.message.errorMessage;
+				const eventUsage = event.message.usage;
+				if (eventUsage) {
+					usage.turns++;
+					usage.input += eventUsage.input ?? eventUsage.inputTokens ?? 0;
+					usage.output += eventUsage.output ?? eventUsage.outputTokens ?? 0;
+					usage.cacheRead += eventUsage.cacheRead ?? 0;
+					usage.cacheWrite += eventUsage.cacheWrite ?? 0;
+					usage.cost += eventUsage.cost?.total ?? 0;
+				}
+				const stopReason = (event.message as { stopReason?: string }).stopReason;
+				const hasToolCall = Array.isArray(event.message.content)
+					&& event.message.content.some((part) => (part as { type?: string }).type === "toolCall");
+				if (stopReason === "stop" && !hasToolCall) startFinalDrain();
+			}
+		};
+
+		const processStderrText = (text: string) => {
+			stderr += text;
+			stderrBuf += text;
+			outputStream.write(text);
+			if (!childEventContext) return;
+			const lines = stderrBuf.split("\n");
+			stderrBuf = lines.pop() || "";
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				appendChildLine("subagent.child.stderr", line);
+			}
+		};
+
+		// Guard both cases that can leave the parent waiting on `close` forever:
+		// a lingering stdio holder after `exit`, or a child that never exits.
+		const FINAL_DRAIN_MS = 5000;
+		const HARD_KILL_MS = 3000;
+		let childExited = false;
+		let forcedTerminationSignal = false;
+		let finalDrainTimer: NodeJS.Timeout | undefined;
+		let finalHardKillTimer: NodeJS.Timeout | undefined;
+		let settled = false;
+		const clearStdioGuard = attachPostExitStdioGuard(child, { idleMs: 2000, hardMs: 8000 });
 		child.stdout.on("data", (chunk: Buffer) => {
 			const text = chunk.toString();
-			stdout += text;
-			outputStream.write(text);
+			stdoutBuf += text;
+			const lines = stdoutBuf.split("\n");
+			stdoutBuf = lines.pop() || "";
+			for (const line of lines) processStdoutLine(line);
 		});
 
 		child.stderr.on("data", (chunk: Buffer) => {
-			outputStream.write(chunk.toString());
+			processStderrText(chunk.toString());
+		});
+		registerInterrupt?.(() => {
+			if (settled) return;
+			interrupted = true;
+			if (!error) error = "Interrupted. Waiting for explicit next action.";
+			trySignalChild(child, "SIGINT");
+			setTimeout(() => {
+				if (!settled) trySignalChild(child, "SIGTERM");
+			}, 1000).unref?.();
+		});
+		const clearDrainTimers = () => {
+			if (finalDrainTimer) {
+				clearTimeout(finalDrainTimer);
+				finalDrainTimer = undefined;
+			}
+			if (finalHardKillTimer) {
+				clearTimeout(finalHardKillTimer);
+				finalHardKillTimer = undefined;
+			}
+		};
+		function startFinalDrain(): void {
+			if (childExited || finalDrainTimer || settled) return;
+			finalDrainTimer = setTimeout(() => {
+				if (settled) return;
+				const termSent = trySignalChild(child, "SIGTERM");
+				if (!termSent) return;
+				forcedTerminationSignal = true;
+				if (!error) {
+					error = `Subagent process did not exit within ${FINAL_DRAIN_MS}ms after its final message. Forcing termination.`;
+				}
+				finalHardKillTimer = setTimeout(() => {
+					if (settled) return;
+					forcedTerminationSignal = trySignalChild(child, "SIGKILL") || forcedTerminationSignal;
+				}, HARD_KILL_MS);
+				finalHardKillTimer.unref?.();
+			}, FINAL_DRAIN_MS);
+			finalDrainTimer.unref?.();
+		}
+		child.on("exit", () => {
+			childExited = true;
+			clearDrainTimers();
+		});
+		child.on("close", (exitCode, signal) => {
+			settled = true;
+			registerInterrupt?.(undefined);
+			clearDrainTimers();
+			clearStdioGuard();
+			if (stdoutBuf.trim()) processStdoutLine(stdoutBuf);
+			if (stderrBuf.trim()) appendChildLine("subagent.child.stderr", stderrBuf);
+			outputStream.end();
+			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
+			resolve({
+				stderr,
+				exitCode: interrupted ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,
+				messages,
+				usage,
+				model,
+				error: interrupted ? undefined : error,
+				finalOutput,
+				interrupted,
+			});
 		});
 
-		child.on("close", (exitCode) => {
+		child.on("error", (spawnError) => {
+			settled = true;
+			registerInterrupt?.(undefined);
+			clearDrainTimers();
+			clearStdioGuard();
 			outputStream.end();
-			resolve({ stdout, exitCode });
-		});
-
-		child.on("error", () => {
-			outputStream.end();
-			resolve({ stdout, exitCode: 1 });
+			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
+			const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
+			resolve({ stderr, exitCode: 1, messages, usage, model, error: error ?? spawnErrorMessage, finalOutput });
 		});
 	});
 }
@@ -143,7 +382,9 @@ function resolvePiPackageRootFallback(): string {
 		try {
 			const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
 			if (pkg.name === "@mariozechner/pi-coding-agent") return dir;
-		} catch {}
+		} catch {
+			// Keep walking up until a readable package.json is found.
+		}
 		dir = path.dirname(dir);
 	}
 	throw new Error("Could not resolve @mariozechner/pi-coding-agent package root");
@@ -191,7 +432,20 @@ function createShareLink(htmlPath: string): { shareUrl: string; gistUrl: string 
 
 function writeJson(filePath: string, payload: object): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf-8");
+	const tempPath = path.join(
+		path.dirname(filePath),
+		`.${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`,
+	);
+	try {
+		fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), "utf-8");
+		fs.renameSync(tempPath, filePath);
+	} finally {
+		if (fs.existsSync(tempPath)) {
+			try {
+				fs.unlinkSync(tempPath);
+			} catch {}
+		}
+	}
 }
 
 function formatDuration(ms: number): string {
@@ -268,62 +522,31 @@ interface SingleStepContext {
 	flatStepCount: number;
 	outputFile: string;
 	piPackageRoot?: string;
+	piArgv1?: string;
+	registerInterrupt?: (interrupt: (() => void) | undefined) => void;
+	childIntercomTarget?: string;
 }
 
 /** Run a single pi agent step, returning output and metadata */
 async function runSingleStep(
 	step: SubagentStep,
 	ctx: SingleStepContext,
-): Promise<{ agent: string; output: string; exitCode: number | null; artifactPaths?: ArtifactPaths }> {
-	const args = ["-p"];
-	if (!ctx.sessionEnabled) {
-		args.push("--no-session");
-	}
-	if (ctx.sessionDir) {
-		try { fs.mkdirSync(ctx.sessionDir, { recursive: true }); } catch {}
-		args.push("--session-dir", ctx.sessionDir);
-	}
-	if (step.model) args.push("--models", step.model);
-
-	const toolExtensionPaths: string[] = [];
-	if (step.tools?.length) {
-		const builtinTools: string[] = [];
-		for (const tool of step.tools) {
-			if (tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")) {
-				toolExtensionPaths.push(tool);
-			} else {
-				builtinTools.push(tool);
-			}
-		}
-		if (builtinTools.length > 0) args.push("--tools", builtinTools.join(","));
-	}
-	if (step.extensions !== undefined) {
-		args.push("--no-extensions");
-		for (const extPath of step.extensions) args.push("--extension", extPath);
-	} else {
-		for (const extPath of toolExtensionPaths) args.push("--extension", extPath);
-	}
-
-	let tmpDir: string | null = null;
-	if (step.systemPrompt) {
-		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-		const promptPath = path.join(tmpDir, "prompt.md");
-		fs.writeFileSync(promptPath, step.systemPrompt);
-		args.push("--append-system-prompt", promptPath);
-	}
-
+): Promise<{
+	agent: string;
+	output: string;
+	exitCode: number | null;
+	error?: string;
+	model?: string;
+	attemptedModels?: string[];
+	modelAttempts?: ModelAttempt[];
+	artifactPaths?: ArtifactPaths;
+	interrupted?: boolean;
+}> {
 	const placeholderRegex = new RegExp(ctx.placeholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
 	const task = step.task.replace(placeholderRegex, () => ctx.previousOutput);
-
-	const TASK_ARG_LIMIT = 8000;
-	if (task.length > TASK_ARG_LIMIT) {
-		if (!tmpDir) tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-		const taskFilePath = path.join(tmpDir, "task.md");
-		fs.writeFileSync(taskFilePath, `Task: ${task}`, { mode: 0o600 });
-		args.push(`@${taskFilePath}`);
-	} else {
-		args.push(`Task: ${task}`);
-	}
+	const sessionEnabled = Boolean(step.sessionFile) || ctx.sessionEnabled;
+	const sessionDir = step.sessionFile ? undefined : ctx.sessionDir;
+	const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
 
 	let artifactPaths: ArtifactPaths | undefined;
 	if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false) {
@@ -335,32 +558,88 @@ async function runSingleStep(
 		}
 	}
 
-	const mcpEnv: Record<string, string | undefined> = {};
-	if (step.mcpDirectTools?.length) {
-		mcpEnv.MCP_DIRECT_TOOLS = step.mcpDirectTools.join(",");
-	} else {
-		mcpEnv.MCP_DIRECT_TOOLS = "__none__";
+	const candidates = step.modelCandidates && step.modelCandidates.length > 0
+		? step.modelCandidates
+		: step.model
+			? [step.model]
+			: [undefined];
+	const attemptedModels: string[] = [];
+	const modelAttempts: ModelAttempt[] = [];
+	const attemptNotes: string[] = [];
+	const eventsPath = path.join(path.dirname(ctx.outputFile), "events.jsonl");
+	let finalResult: RunPiStreamingResult | undefined;
+
+	for (let index = 0; index < candidates.length; index++) {
+		const candidate = candidates[index];
+		const { args, env, tempDir } = buildPiArgs({
+			baseArgs: ["--mode", "json", "-p"],
+			task,
+			sessionEnabled,
+			sessionDir,
+			sessionFile: step.sessionFile,
+			model: candidate,
+			inheritProjectContext: step.inheritProjectContext,
+			inheritSkills: step.inheritSkills,
+			tools: step.tools,
+			extensions: step.extensions,
+			systemPrompt: step.systemPrompt,
+			systemPromptMode: step.systemPromptMode,
+			mcpDirectTools: step.mcpDirectTools,
+			promptFileStem: step.agent,
+			intercomSessionName: ctx.childIntercomTarget,
+		});
+		const run = await runPiStreaming(
+			args,
+			step.cwd ?? ctx.cwd,
+			ctx.outputFile,
+			env,
+			ctx.piPackageRoot,
+			ctx.piArgv1,
+			step.maxSubagentDepth,
+			{ eventsPath, runId: ctx.id, stepIndex: ctx.flatIndex, agent: step.agent },
+			ctx.registerInterrupt,
+		);
+		cleanupTempDir(tempDir);
+
+		const hiddenError = run.exitCode === 0 && !run.error ? detectSubagentError(run.messages) : null;
+		const effectiveExitCode = hiddenError?.hasError ? (hiddenError.exitCode ?? 1) : run.exitCode;
+		const error = hiddenError?.hasError
+			? hiddenError.details
+				? `${hiddenError.errorType} failed (exit ${effectiveExitCode}): ${hiddenError.details}`
+				: `${hiddenError.errorType} failed with exit code ${effectiveExitCode}`
+			: run.error || (run.exitCode !== 0 && run.stderr.trim() ? run.stderr.trim() : undefined);
+		const attempt: ModelAttempt = {
+			model: candidate ?? run.model ?? step.model ?? "default",
+			success: effectiveExitCode === 0 && !error,
+			exitCode: effectiveExitCode,
+			error,
+			usage: run.usage,
+		};
+		modelAttempts.push(attempt);
+		if (candidate) attemptedModels.push(candidate);
+		finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error };
+		if (attempt.success) break;
+		if (!isRetryableModelFailure(error) || index === candidates.length - 1) break;
+		attemptNotes.push(formatModelAttemptNote(attempt, candidates[index + 1]));
 	}
 
-	const result = await runPiStreaming(args, step.cwd ?? ctx.cwd, ctx.outputFile, mcpEnv, ctx.piPackageRoot);
-
-	if (tmpDir) {
-		try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
-	}
-
-	const output = (result.stdout || "").trim();
+	const rawOutput = finalResult?.finalOutput ?? "";
+	const resolvedOutput = step.outputPath && finalResult?.exitCode === 0
+		? resolveSingleOutput(step.outputPath, rawOutput, outputSnapshot)
+		: { fullOutput: rawOutput };
+	const output = resolvedOutput.fullOutput;
 	let outputForSummary = output;
-	if (step.outputPath && result.exitCode === 0) {
-		const persisted = persistSingleOutput(step.outputPath, output);
-		if (persisted.savedPath) {
-			outputForSummary = output
-				? `${output}\n\n📄 Output saved to: ${persisted.savedPath}`
-				: `📄 Output saved to: ${persisted.savedPath}`;
-		} else if (persisted.error) {
-			outputForSummary = output
-				? `${output}\n\n⚠️ Failed to save output to: ${step.outputPath}\n${persisted.error}`
-				: `⚠️ Failed to save output to: ${step.outputPath}\n${persisted.error}`;
-		}
+	if (attemptNotes.length > 0) {
+		outputForSummary = `${attemptNotes.join("\n")}\n\n${outputForSummary}`.trim();
+	}
+	if (resolvedOutput.savedPath) {
+		outputForSummary = outputForSummary
+			? `${outputForSummary}\n\nOutput saved to: ${resolvedOutput.savedPath}`
+			: `Output saved to: ${resolvedOutput.savedPath}`;
+	} else if (resolvedOutput.saveError && step.outputPath && finalResult?.exitCode === 0) {
+		outputForSummary = outputForSummary
+			? `${outputForSummary}\n\nFailed to save output to: ${step.outputPath}\n${resolvedOutput.saveError}`
+			: `Failed to save output to: ${step.outputPath}\n${resolvedOutput.saveError}`;
 	}
 
 	if (artifactPaths && ctx.artifactConfig?.enabled !== false) {
@@ -374,7 +653,10 @@ async function runSingleStep(
 					runId: ctx.id,
 					agent: step.agent,
 					task,
-					exitCode: result.exitCode,
+					exitCode: finalResult?.exitCode,
+					model: finalResult?.model,
+					attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
+					modelAttempts,
 					skills: step.skills,
 					timestamp: Date.now(),
 				}, null, 2),
@@ -383,7 +665,156 @@ async function runSingleStep(
 		}
 	}
 
-	return { agent: step.agent, output: outputForSummary, exitCode: result.exitCode, artifactPaths };
+	return {
+		agent: step.agent,
+		output: outputForSummary,
+		exitCode: finalResult?.exitCode ?? 1,
+		error: finalResult?.error,
+		model: finalResult?.model,
+		attemptedModels: attemptedModels.length > 0 ? attemptedModels : undefined,
+		modelAttempts,
+		artifactPaths,
+		interrupted: finalResult?.interrupted,
+	};
+}
+
+type RunnerStatusPayload = {
+	runId: string;
+	mode: "single" | "chain";
+	state: "queued" | "running" | "complete" | "failed" | "paused";
+	activityState?: ActivityState;
+	lastActivityAt?: number;
+	currentTool?: string;
+	currentToolStartedAt?: number;
+	startedAt: number;
+	endedAt?: number;
+	lastUpdate: number;
+	pid: number;
+	cwd: string;
+	currentStep: number;
+	steps: Array<{
+		agent: string;
+		status: "pending" | "running" | "complete" | "failed";
+		activityState?: ActivityState;
+		lastActivityAt?: number;
+		currentTool?: string;
+		currentToolStartedAt?: number;
+		startedAt?: number;
+		endedAt?: number;
+		durationMs?: number;
+		exitCode?: number | null;
+		tokens?: TokenUsage;
+		skills?: string[];
+		model?: string;
+		attemptedModels?: string[];
+		modelAttempts?: ModelAttempt[];
+		error?: string;
+	}>;
+	artifactsDir?: string;
+	sessionDir?: string;
+	outputFile?: string;
+	totalTokens?: TokenUsage;
+	sessionFile?: string;
+	shareUrl?: string;
+	gistUrl?: string;
+	shareError?: string;
+	error?: string;
+};
+
+function markParallelGroupSetupFailure(input: {
+	statusPayload: RunnerStatusPayload;
+	results: StepResult[];
+	group: Extract<RunnerStep, { parallel: SubagentStep[] }>;
+	groupStartFlatIndex: number;
+	setupError: string;
+	failedAt: number;
+	statusPath: string;
+	eventsPath: string;
+	asyncDir: string;
+	runId: string;
+	stepIndex: number;
+}): void {
+	for (let taskIndex = 0; taskIndex < input.group.parallel.length; taskIndex++) {
+		const flatTaskIndex = input.groupStartFlatIndex + taskIndex;
+		input.statusPayload.steps[flatTaskIndex].status = "failed";
+		input.statusPayload.steps[flatTaskIndex].startedAt = input.failedAt;
+		input.statusPayload.steps[flatTaskIndex].endedAt = input.failedAt;
+		input.statusPayload.steps[flatTaskIndex].durationMs = 0;
+		input.statusPayload.steps[flatTaskIndex].exitCode = 1;
+		input.results.push({ agent: input.group.parallel[taskIndex].agent, output: input.setupError, success: false });
+	}
+	input.statusPayload.currentStep = input.groupStartFlatIndex;
+	input.statusPayload.lastUpdate = input.failedAt;
+	input.statusPayload.outputFile = path.join(input.asyncDir, `output-${input.groupStartFlatIndex}.log`);
+	writeJson(input.statusPath, input.statusPayload);
+	appendJsonl(input.eventsPath, JSON.stringify({
+		type: "subagent.parallel.completed",
+		ts: input.failedAt,
+		runId: input.runId,
+		stepIndex: input.stepIndex,
+		success: false,
+	}));
+}
+
+function markParallelGroupRunning(input: {
+	statusPayload: RunnerStatusPayload;
+	group: Extract<RunnerStep, { parallel: SubagentStep[] }>;
+	groupStartFlatIndex: number;
+	groupStartTime: number;
+	statusPath: string;
+	eventsPath: string;
+	asyncDir: string;
+	runId: string;
+	stepIndex: number;
+}): void {
+	for (let taskIndex = 0; taskIndex < input.group.parallel.length; taskIndex++) {
+		const flatTaskIndex = input.groupStartFlatIndex + taskIndex;
+		input.statusPayload.steps[flatTaskIndex].status = "running";
+		input.statusPayload.steps[flatTaskIndex].startedAt = input.groupStartTime;
+		input.statusPayload.steps[flatTaskIndex].lastActivityAt = input.groupStartTime;
+	}
+	input.statusPayload.currentStep = input.groupStartFlatIndex;
+	input.statusPayload.activityState = undefined;
+	input.statusPayload.lastActivityAt = input.groupStartTime;
+	input.statusPayload.lastUpdate = input.groupStartTime;
+	input.statusPayload.outputFile = path.join(input.asyncDir, `output-${input.groupStartFlatIndex}.log`);
+	writeJson(input.statusPath, input.statusPayload);
+	appendJsonl(input.eventsPath, JSON.stringify({
+		type: "subagent.parallel.started",
+		ts: input.groupStartTime,
+		runId: input.runId,
+		stepIndex: input.stepIndex,
+		agents: input.group.parallel.map((task) => task.agent),
+		count: input.group.parallel.length,
+	}));
+}
+
+function prepareParallelTaskRun(
+	task: SubagentStep,
+	cwd: string,
+	worktreeSetup: WorktreeSetup | undefined,
+	taskIndex: number,
+): { taskForRun: SubagentStep; taskCwd: string } {
+	if (!worktreeSetup) return { taskForRun: task, taskCwd: cwd };
+	return {
+		taskForRun: { ...task, cwd: undefined },
+		taskCwd: worktreeSetup.worktrees[taskIndex]!.agentCwd,
+	};
+}
+
+function appendParallelWorktreeSummary(
+	previousOutput: string,
+	worktreeSetup: WorktreeSetup | undefined,
+	asyncDir: string,
+	stepIndex: number,
+	group: Extract<RunnerStep, { parallel: SubagentStep[] }>,
+): string {
+	if (!worktreeSetup) return previousOutput;
+	const diffsDir = path.join(asyncDir, "worktree-diffs", `step-${stepIndex}`);
+	const diffs = diffWorktrees(worktreeSetup, group.parallel.map((task) => task.agent), diffsDir);
+	const diffSummary = formatWorktreeDiffSummary(diffs);
+	if (!diffSummary) return previousOutput;
+	return `${previousOutput}\n\n${diffSummary}`;
 }
 
 async function runSubagent(config: SubagentRunConfig): Promise<void> {
@@ -393,55 +824,39 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const results: StepResult[] = [];
 	const overallStartTime = Date.now();
 	const shareEnabled = config.share === true;
-	const sessionEnabled = Boolean(config.sessionDir) || shareEnabled;
 	const asyncDir = config.asyncDir;
 	const statusPath = path.join(asyncDir, "status.json");
 	const eventsPath = path.join(asyncDir, "events.jsonl");
 	const logPath = path.join(asyncDir, `subagent-log-${id}.md`);
+	const controlConfig = config.controlConfig ?? DEFAULT_CONTROL_CONFIG;
+	let activeChildInterrupt: (() => void) | undefined;
+	let interrupted = false;
+	let currentActivityState: ActivityState | undefined;
+	let activityTimer: NodeJS.Timeout | undefined;
 	let previousCumulativeTokens: TokenUsage = { input: 0, output: 0, total: 0 };
+	let latestSessionFile: string | undefined;
 
-	// Flatten steps for status tracking (parallel groups expand to individual entries)
 	const flatSteps = flattenSteps(steps);
-	const statusPayload: {
-		runId: string;
-		mode: "single" | "chain";
-		state: "queued" | "running" | "complete" | "failed";
-		startedAt: number;
-		endedAt?: number;
-		lastUpdate: number;
-		pid: number;
-		cwd: string;
-		currentStep: number;
-		steps: Array<{
-			agent: string;
-			status: "pending" | "running" | "complete" | "failed";
-			startedAt?: number;
-			endedAt?: number;
-			durationMs?: number;
-			exitCode?: number | null;
-			error?: string;
-			tokens?: TokenUsage;
-			skills?: string[];
-		}>;
-		artifactsDir?: string;
-		sessionDir?: string;
-		outputFile?: string;
-		totalTokens?: TokenUsage;
-		sessionFile?: string;
-		shareUrl?: string;
-		gistUrl?: string;
-		shareError?: string;
-		error?: string;
-	} = {
+	const sessionEnabled = Boolean(config.sessionDir)
+		|| shareEnabled
+		|| flatSteps.some((step) => Boolean(step.sessionFile));
+	const statusPayload: RunnerStatusPayload = {
 		runId: id,
 		mode: flatSteps.length > 1 ? "chain" : "single",
 		state: "running",
+		lastActivityAt: overallStartTime,
 		startedAt: overallStartTime,
 		lastUpdate: overallStartTime,
 		pid: process.pid,
 		cwd,
 		currentStep: 0,
-		steps: flatSteps.map((step) => ({ agent: step.agent, status: "pending", skills: step.skills })),
+		steps: flatSteps.map((step) => ({
+			agent: step.agent,
+			status: "pending",
+			skills: step.skills,
+			model: step.model,
+			attemptedModels: step.modelCandidates && step.modelCandidates.length > 0 ? step.modelCandidates : step.model ? [step.model] : undefined,
+		})),
 		artifactsDir,
 		sessionDir: config.sessionDir,
 		outputFile: path.join(asyncDir, "output-0.log"),
@@ -449,6 +864,107 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 
 	fs.mkdirSync(asyncDir, { recursive: true });
 	writeJson(statusPath, statusPayload);
+
+	const currentStepAgent = () => statusPayload.steps[statusPayload.currentStep]?.agent ?? flatSteps[statusPayload.currentStep]?.agent ?? "subagent";
+	const currentOutputActivityAt = (): number => {
+		const runningIndexes = statusPayload.steps
+			.map((step, index) => step.status === "running" ? index : -1)
+			.filter((index) => index >= 0);
+		let lastActivityAt = statusPayload.steps[statusPayload.currentStep]?.startedAt ?? overallStartTime;
+		for (const index of runningIndexes.length > 0 ? runningIndexes : [statusPayload.currentStep]) {
+			try {
+				lastActivityAt = Math.max(lastActivityAt, fs.statSync(path.join(asyncDir, `output-${index}.log`)).mtimeMs);
+			} catch {
+				// Missing output files are normal before a child writes its first line.
+			}
+		}
+		return lastActivityAt;
+	};
+	const emittedControlEventKeys = new Set<string>();
+	const appendControlEvent = (event: ReturnType<typeof buildControlEvent>) => {
+		const childIntercomTarget = config.childIntercomTargets?.[statusPayload.currentStep];
+		if (controlConfig.notifyChannels.length === 0 || !claimControlNotification(controlConfig, event, emittedControlEventKeys, childIntercomTarget)) return;
+		appendJsonl(eventsPath, JSON.stringify({
+			type: "subagent.control",
+			event,
+			channels: controlConfig.notifyChannels,
+			childIntercomTarget,
+			noticeText: formatControlNoticeMessage(event, childIntercomTarget),
+			...(config.controlIntercomTarget && controlConfig.notifyChannels.includes("intercom") ? {
+				intercom: {
+					to: config.controlIntercomTarget,
+					message: formatControlIntercomMessage(event, childIntercomTarget),
+				},
+			} : {}),
+		}));
+	};
+	const updateRunnerActivityState = (now: number): boolean => {
+		const lastActivityAt = currentOutputActivityAt();
+		const next = deriveActivityState({
+			config: controlConfig,
+			startedAt: overallStartTime,
+			lastActivityAt,
+			now,
+		});
+		if (next === currentActivityState && statusPayload.lastActivityAt === lastActivityAt) return false;
+		const previous = currentActivityState;
+		currentActivityState = next;
+		statusPayload.activityState = next;
+		statusPayload.lastActivityAt = lastActivityAt;
+		for (const step of statusPayload.steps) {
+			if (step.status === "running") {
+				step.activityState = next;
+				step.lastActivityAt = lastActivityAt;
+			}
+		}
+		statusPayload.lastUpdate = now;
+		if (shouldEmitControlEvent(controlConfig, previous, next)) {
+			const event = buildControlEvent({
+				from: previous,
+				to: next,
+				runId: id,
+				agent: currentStepAgent(),
+				index: statusPayload.currentStep,
+				ts: now,
+				lastActivityAt,
+			});
+			appendControlEvent(event);
+		}
+		writeJson(statusPath, statusPayload);
+		return true;
+	};
+	if (controlConfig.enabled) {
+		activityTimer = setInterval(() => {
+			if (statusPayload.state !== "running") return;
+			const now = Date.now();
+			updateRunnerActivityState(now);
+		}, 1000);
+		activityTimer.unref?.();
+	}
+
+	const interruptRunner = () => {
+		if (interrupted || statusPayload.state !== "running") return;
+		interrupted = true;
+		const now = Date.now();
+		statusPayload.state = "paused";
+		currentActivityState = undefined;
+		statusPayload.activityState = undefined;
+		statusPayload.lastUpdate = now;
+		const current = statusPayload.steps[statusPayload.currentStep];
+		if (current?.status === "running") {
+			current.activityState = undefined;
+			current.endedAt = now;
+			current.durationMs = current.startedAt ? now - current.startedAt : undefined;
+		}
+		writeJson(statusPath, statusPayload);
+		appendJsonl(eventsPath, JSON.stringify({
+			type: "subagent.run.paused",
+			ts: now,
+			runId: id,
+		}));
+		activeChildInterrupt?.();
+	};
+	process.on(ASYNC_INTERRUPT_SIGNAL, interruptRunner);
 	appendJsonl(
 		eventsPath,
 		JSON.stringify({
@@ -461,149 +977,212 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		}),
 	);
 
-	// Track the flat index into statusPayload.steps across sequential + parallel steps
 	let flatIndex = 0;
 
 	for (let stepIndex = 0; stepIndex < steps.length; stepIndex++) {
+		if (interrupted) break;
 		const step = steps[stepIndex];
 
 		if (isParallelGroup(step)) {
-			// === PARALLEL STEP GROUP ===
 			const group = step;
 			const concurrency = group.concurrency ?? MAX_PARALLEL_CONCURRENCY;
 			const failFast = group.failFast ?? false;
 			const groupStartFlatIndex = flatIndex;
 			let aborted = false;
-
-			// Mark all tasks in the group as running
-			const groupStartTime = Date.now();
-			for (let t = 0; t < group.parallel.length; t++) {
-				const fi = groupStartFlatIndex + t;
-				statusPayload.steps[fi].status = "running";
-				statusPayload.steps[fi].startedAt = groupStartTime;
-			}
-			statusPayload.currentStep = groupStartFlatIndex;
-			statusPayload.lastUpdate = groupStartTime;
-			statusPayload.outputFile = path.join(asyncDir, `output-${groupStartFlatIndex}.log`);
-			writeJson(statusPath, statusPayload);
-
-			appendJsonl(eventsPath, JSON.stringify({
-				type: "subagent.parallel.started",
-				ts: groupStartTime,
-				runId: id,
-				stepIndex,
-				agents: group.parallel.map((t) => t.agent),
-				count: group.parallel.length,
-			}));
-
-			const parallelResults = await mapConcurrent(
-				group.parallel,
-				concurrency,
-				async (task, taskIdx) => {
-					if (aborted && failFast) {
-						return { agent: task.agent, output: "(skipped — fail-fast)", exitCode: -1 as number | null, skipped: true };
-					}
-
-					const fi = groupStartFlatIndex + taskIdx;
-					const taskStartTime = Date.now();
-
-					appendJsonl(eventsPath, JSON.stringify({
-						type: "subagent.step.started", ts: taskStartTime, runId: id, stepIndex: fi, agent: task.agent,
-					}));
-
-					// Each parallel task gets its own session subdirectory to avoid conflicts
-					const taskSessionDir = config.sessionDir
-						? path.join(config.sessionDir, `parallel-${taskIdx}`)
-						: undefined;
-
-					const singleResult = await runSingleStep(task, {
-						previousOutput, placeholder, cwd, sessionEnabled,
-						sessionDir: taskSessionDir,
-						artifactsDir, artifactConfig, id,
-						flatIndex: fi, flatStepCount: flatSteps.length,
-						outputFile: path.join(asyncDir, `output-${fi}.log`),
-						piPackageRoot: config.piPackageRoot,
+			let worktreeSetup: WorktreeSetup | undefined;
+			if (group.worktree) {
+				const worktreeTaskCwdConflict = findWorktreeTaskCwdConflict(group.parallel, cwd);
+				if (worktreeTaskCwdConflict) {
+					const failedAt = Date.now();
+					markParallelGroupSetupFailure({
+						statusPayload,
+						results,
+						group,
+						groupStartFlatIndex,
+						setupError: formatWorktreeTaskCwdConflict(worktreeTaskCwdConflict, cwd),
+						failedAt,
+						statusPath,
+						eventsPath,
+						asyncDir,
+						runId: id,
+						stepIndex,
 					});
+					flatIndex += group.parallel.length;
+					break;
+				}
+				try {
+					worktreeSetup = createWorktrees(cwd, `${id}-s${stepIndex}`, group.parallel.length, {
+						agents: group.parallel.map((task) => task.agent),
+						setupHook: config.worktreeSetupHook
+							? { hookPath: config.worktreeSetupHook, timeoutMs: config.worktreeSetupHookTimeoutMs }
+							: undefined,
+					});
+				} catch (error) {
+					const setupError = error instanceof Error ? error.message : String(error);
+					const failedAt = Date.now();
+					markParallelGroupSetupFailure({
+						statusPayload,
+						results,
+						group,
+						groupStartFlatIndex,
+						setupError,
+						failedAt,
+						statusPath,
+						eventsPath,
+						asyncDir,
+						runId: id,
+						stepIndex,
+					});
+					flatIndex += group.parallel.length;
+					break;
+				}
+			}
 
-					const taskEndTime = Date.now();
-					const taskDuration = taskEndTime - taskStartTime;
+			try {
+				const groupStartTime = Date.now();
+				markParallelGroupRunning({
+					statusPayload,
+					group,
+					groupStartFlatIndex,
+					groupStartTime,
+					statusPath,
+					eventsPath,
+					asyncDir,
+					runId: id,
+					stepIndex,
+				});
+				const parallelResults = await mapConcurrent(
+					group.parallel,
+					concurrency,
+					async (task, taskIdx) => {
+						if (aborted && failFast) {
+							return { agent: task.agent, output: "(skipped — fail-fast)", exitCode: -1 as number | null, skipped: true };
+						}
 
-					statusPayload.steps[fi].status = singleResult.exitCode === 0 ? "complete" : "failed";
-					statusPayload.steps[fi].endedAt = taskEndTime;
-					statusPayload.steps[fi].durationMs = taskDuration;
-					statusPayload.steps[fi].exitCode = singleResult.exitCode;
-					statusPayload.lastUpdate = taskEndTime;
-					writeJson(statusPath, statusPayload);
+						const fi = groupStartFlatIndex + taskIdx;
+						const taskStartTime = Date.now();
 
-					appendJsonl(eventsPath, JSON.stringify({
-						type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
-						ts: taskEndTime, runId: id, stepIndex: fi, agent: task.agent,
-						exitCode: singleResult.exitCode, durationMs: taskDuration,
-					}));
+						appendJsonl(eventsPath, JSON.stringify({
+							type: "subagent.step.started", ts: taskStartTime, runId: id, stepIndex: fi, agent: task.agent,
+						}));
 
-					if (singleResult.exitCode !== 0 && failFast) aborted = true;
-					return { ...singleResult, skipped: false };
-				},
-			);
+						const taskSessionDir = config.sessionDir
+							? path.join(config.sessionDir, `parallel-${taskIdx}`)
+							: undefined;
+						const { taskForRun, taskCwd } = prepareParallelTaskRun(task, cwd, worktreeSetup, taskIdx);
 
-			flatIndex += group.parallel.length;
+						const singleResult = await runSingleStep(taskForRun, {
+							previousOutput, placeholder, cwd: taskCwd, sessionEnabled,
+							sessionDir: taskSessionDir,
+							artifactsDir, artifactConfig, id,
+							flatIndex: fi, flatStepCount: flatSteps.length,
+							outputFile: path.join(asyncDir, `output-${fi}.log`),
+							piPackageRoot: config.piPackageRoot,
+							piArgv1: config.piArgv1,
+							childIntercomTarget: config.childIntercomTargets?.[fi],
+							registerInterrupt: (interrupt) => {
+								activeChildInterrupt = interrupt;
+							},
+						});
+						if (task.sessionFile) {
+							latestSessionFile = task.sessionFile;
+						}
 
-			// Aggregate token usage from parallel task session dirs
-			if (config.sessionDir) {
+						const taskEndTime = Date.now();
+						const taskDuration = taskEndTime - taskStartTime;
+
+						statusPayload.steps[fi].status = singleResult.exitCode === 0 ? "complete" : "failed";
+						statusPayload.steps[fi].endedAt = taskEndTime;
+						statusPayload.steps[fi].durationMs = taskDuration;
+						statusPayload.steps[fi].exitCode = singleResult.exitCode;
+						statusPayload.steps[fi].model = singleResult.model;
+						statusPayload.steps[fi].attemptedModels = singleResult.attemptedModels;
+						statusPayload.steps[fi].modelAttempts = singleResult.modelAttempts;
+						statusPayload.steps[fi].error = singleResult.error;
+						statusPayload.lastUpdate = taskEndTime;
+						writeJson(statusPath, statusPayload);
+
+						appendJsonl(eventsPath, JSON.stringify({
+							type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
+							ts: taskEndTime, runId: id, stepIndex: fi, agent: task.agent,
+							exitCode: singleResult.exitCode, durationMs: taskDuration,
+						}));
+
+						if (singleResult.exitCode !== 0 && failFast) aborted = true;
+						return { ...singleResult, skipped: false };
+					},
+				);
+
+				flatIndex += group.parallel.length;
+
 				for (let t = 0; t < group.parallel.length; t++) {
-					const taskSessionDir = path.join(config.sessionDir, `parallel-${t}`);
-					const taskTokens = parseSessionTokens(taskSessionDir);
-					if (taskTokens) {
-						const fi = groupStartFlatIndex + t;
-						statusPayload.steps[fi].tokens = taskTokens;
-						previousCumulativeTokens = {
-							input: previousCumulativeTokens.input + taskTokens.input,
-							output: previousCumulativeTokens.output + taskTokens.output,
-							total: previousCumulativeTokens.total + taskTokens.total,
-						};
-					}
+					const fi = groupStartFlatIndex + t;
+					const sessionTokens = config.sessionDir
+						? parseSessionTokens(path.join(config.sessionDir, `parallel-${t}`))
+						: null;
+					const taskTokens = sessionTokens ?? tokenUsageFromAttempts(parallelResults[t]?.modelAttempts);
+					if (!taskTokens) continue;
+					statusPayload.steps[fi].tokens = taskTokens;
+					previousCumulativeTokens = {
+						input: previousCumulativeTokens.input + taskTokens.input,
+						output: previousCumulativeTokens.output + taskTokens.output,
+						total: previousCumulativeTokens.total + taskTokens.total,
+					};
 				}
 				statusPayload.totalTokens = { ...previousCumulativeTokens };
 				statusPayload.lastUpdate = Date.now();
 				writeJson(statusPath, statusPayload);
-			}
 
-			// Collect results
-			for (const pr of parallelResults) {
-				results.push({
-					agent: pr.agent,
-					output: pr.output,
-					success: pr.exitCode === 0,
-					skipped: pr.skipped,
-					artifactPaths: pr.artifactPaths,
-				});
-			}
+				for (const pr of parallelResults) {
+					results.push({
+						agent: pr.agent,
+						output: pr.output,
+						success: pr.exitCode === 0,
+						skipped: pr.skipped,
+						model: pr.model,
+						attemptedModels: pr.attemptedModels,
+						modelAttempts: pr.modelAttempts,
+						artifactPaths: pr.artifactPaths,
+					});
+				}
 
-			// Aggregate parallel outputs for {previous}
-			previousOutput = aggregateParallelOutputs(
-				parallelResults.map((r) => ({ agent: r.agent, output: r.output, exitCode: r.exitCode })),
-			);
+				previousOutput = aggregateParallelOutputs(
+					parallelResults.map((r) => ({
+					agent: r.agent,
+					output: r.output,
+					exitCode: r.exitCode,
+					error: r.error,
+					model: r.model,
+					attemptedModels: r.attemptedModels,
+				})),
+				);
+				previousOutput = appendParallelWorktreeSummary(previousOutput, worktreeSetup, asyncDir, stepIndex, group);
 
-			appendJsonl(eventsPath, JSON.stringify({
-				type: "subagent.parallel.completed",
-				ts: Date.now(),
-				runId: id,
-				stepIndex,
-				success: parallelResults.every((r) => r.exitCode === 0 || r.exitCode === -1),
-			}));
+				appendJsonl(eventsPath, JSON.stringify({
+					type: "subagent.parallel.completed",
+					ts: Date.now(),
+					runId: id,
+					stepIndex,
+					success: parallelResults.every((r) => r.exitCode === 0 || r.exitCode === -1),
+				}));
 
-			// If any parallel task failed (not skipped), stop the chain
-			if (parallelResults.some((r) => r.exitCode !== 0 && r.exitCode !== -1)) {
-				break;
+				if (parallelResults.some((r) => r.exitCode !== 0 && r.exitCode !== -1)) {
+					break;
+				}
+			} finally {
+				if (worktreeSetup) cleanupWorktrees(worktreeSetup);
 			}
 		} else {
-			// === SEQUENTIAL STEP ===
 			const seqStep = step as SubagentStep;
 			const stepStartTime = Date.now();
 			statusPayload.currentStep = flatIndex;
 			statusPayload.steps[flatIndex].status = "running";
+			statusPayload.steps[flatIndex].activityState = undefined;
+			statusPayload.activityState = undefined;
 			statusPayload.steps[flatIndex].skills = seqStep.skills;
 			statusPayload.steps[flatIndex].startedAt = stepStartTime;
+			statusPayload.steps[flatIndex].lastActivityAt = stepStartTime;
+			statusPayload.lastActivityAt = stepStartTime;
 			statusPayload.lastUpdate = stepStartTime;
 			statusPayload.outputFile = path.join(asyncDir, `output-${flatIndex}.log`);
 			writeJson(statusPath, statusPayload);
@@ -623,18 +1202,29 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				flatIndex, flatStepCount: flatSteps.length,
 				outputFile: path.join(asyncDir, `output-${flatIndex}.log`),
 				piPackageRoot: config.piPackageRoot,
+				piArgv1: config.piArgv1,
+				childIntercomTarget: config.childIntercomTargets?.[flatIndex],
+				registerInterrupt: (interrupt) => {
+					activeChildInterrupt = interrupt;
+				},
 			});
+			if (seqStep.sessionFile) {
+				latestSessionFile = seqStep.sessionFile;
+			}
 
 			previousOutput = singleResult.output;
 			results.push({
 				agent: singleResult.agent,
 				output: singleResult.output,
 				success: singleResult.exitCode === 0,
+				model: singleResult.model,
+				attemptedModels: singleResult.attemptedModels,
+				modelAttempts: singleResult.modelAttempts,
 				artifactPaths: singleResult.artifactPaths,
 			});
 
 			const cumulativeTokens = config.sessionDir ? parseSessionTokens(config.sessionDir) : null;
-			const stepTokens: TokenUsage | null = cumulativeTokens
+			let stepTokens: TokenUsage | null = cumulativeTokens
 				? {
 						input: cumulativeTokens.input - previousCumulativeTokens.input,
 						output: cumulativeTokens.output - previousCumulativeTokens.output,
@@ -643,6 +1233,15 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				: null;
 			if (cumulativeTokens) {
 				previousCumulativeTokens = cumulativeTokens;
+			} else {
+				stepTokens = tokenUsageFromAttempts(singleResult.modelAttempts);
+				if (stepTokens) {
+					previousCumulativeTokens = {
+						input: previousCumulativeTokens.input + stepTokens.input,
+						output: previousCumulativeTokens.output + stepTokens.output,
+						total: previousCumulativeTokens.total + stepTokens.total,
+					};
+				}
 			}
 
 			const stepEndTime = Date.now();
@@ -650,6 +1249,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.steps[flatIndex].endedAt = stepEndTime;
 			statusPayload.steps[flatIndex].durationMs = stepEndTime - stepStartTime;
 			statusPayload.steps[flatIndex].exitCode = singleResult.exitCode;
+			statusPayload.steps[flatIndex].model = singleResult.model;
+			statusPayload.steps[flatIndex].attemptedModels = singleResult.attemptedModels;
+			statusPayload.steps[flatIndex].modelAttempts = singleResult.modelAttempts;
+			statusPayload.steps[flatIndex].error = singleResult.error;
 			if (stepTokens) {
 				statusPayload.steps[flatIndex].tokens = stepTokens;
 				statusPayload.totalTokens = { ...previousCumulativeTokens };
@@ -696,11 +1299,17 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	let gistUrl: string | undefined;
 	let shareError: string | undefined;
 
-	if (shareEnabled && config.sessionDir) {
-		sessionFile = findLatestSessionFile(config.sessionDir) ?? undefined;
+	if (shareEnabled) {
+		sessionFile = config.sessionDir
+			? (findLatestSessionFile(config.sessionDir) ?? undefined)
+			: undefined;
+		if (!sessionFile && latestSessionFile) {
+			sessionFile = latestSessionFile;
+		}
 		if (sessionFile) {
 			try {
-				const htmlPath = await exportSessionHtml(sessionFile, config.sessionDir, config.piPackageRoot);
+				const exportDir = config.sessionDir ?? path.dirname(sessionFile);
+				const htmlPath = await exportSessionHtml(sessionFile, exportDir, config.piPackageRoot);
 				const share = createShareLink(htmlPath);
 				if ("error" in share) shareError = share.error;
 				else {
@@ -715,11 +1324,17 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		}
 	}
 
+	if (activityTimer) {
+		clearInterval(activityTimer);
+		activityTimer = undefined;
+	}
+	const effectiveSessionFile = sessionFile ?? latestSessionFile;
 	const runEndedAt = Date.now();
-	statusPayload.state = results.every((r) => r.success) ? "complete" : "failed";
+	statusPayload.state = interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed";
+	statusPayload.activityState = undefined;
 	statusPayload.endedAt = runEndedAt;
 	statusPayload.lastUpdate = runEndedAt;
-	statusPayload.sessionFile = sessionFile;
+	statusPayload.sessionFile = effectiveSessionFile;
 	statusPayload.shareUrl = shareUrl;
 	statusPayload.gistUrl = gistUrl;
 	statusPayload.shareError = shareError;
@@ -754,44 +1369,44 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		summary,
 		truncated,
 		artifactsDir,
-		sessionFile,
+		sessionFile: effectiveSessionFile,
 		shareUrl,
 		shareError,
 	});
 
 	try {
-		fs.mkdirSync(path.dirname(resultPath), { recursive: true });
-		fs.writeFileSync(
-			resultPath,
-			JSON.stringify({
-				id,
-				agent: agentName,
-				success: results.every((r) => r.success),
-				summary,
-				results: results.map((r) => ({
-					agent: r.agent,
-					output: r.output,
-					success: r.success,
-					skipped: r.skipped || undefined,
-					artifactPaths: r.artifactPaths,
-					truncated: r.truncated,
-				})),
-				exitCode: results.every((r) => r.success) ? 0 : 1,
-				timestamp: runEndedAt,
-				durationMs: runEndedAt - overallStartTime,
-				truncated,
-				artifactsDir,
-				cwd,
-				asyncDir,
-				sessionId: config.sessionId,
-				sessionFile,
-				shareUrl,
-				gistUrl,
-				shareError,
-				...(taskIndex !== undefined && { taskIndex }),
-				...(totalTasks !== undefined && { totalTasks }),
-			}),
-		);
+		writeJson(resultPath, {
+			id,
+			agent: agentName,
+			success: !interrupted && results.every((r) => r.success),
+			state: interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed",
+			summary: interrupted ? "Paused after interrupt. Waiting for explicit next action." : summary,
+			results: results.map((r) => ({
+				agent: r.agent,
+				output: r.output,
+				success: r.success,
+				skipped: r.skipped || undefined,
+				model: r.model,
+				attemptedModels: r.attemptedModels,
+				modelAttempts: r.modelAttempts,
+				artifactPaths: r.artifactPaths,
+				truncated: r.truncated,
+			})),
+			exitCode: interrupted || results.every((r) => r.success) ? 0 : 1,
+			timestamp: runEndedAt,
+			durationMs: runEndedAt - overallStartTime,
+			truncated,
+			artifactsDir,
+			cwd,
+			asyncDir,
+			sessionId: config.sessionId,
+			sessionFile: effectiveSessionFile,
+			shareUrl,
+			gistUrl,
+			shareError,
+			...(taskIndex !== undefined && { taskIndex }),
+			...(totalTasks !== undefined && { totalTasks }),
+		});
 	} catch (err) {
 		console.error(`Failed to write result file ${resultPath}:`, err);
 	}
@@ -804,7 +1419,9 @@ if (configArg) {
 		const config = JSON.parse(configJson) as SubagentRunConfig;
 		try {
 			fs.unlinkSync(configArg);
-		} catch {}
+		} catch {
+			// Temp config cleanup is best effort.
+		}
 		runSubagent(config).catch((runErr) => {
 			console.error("Subagent runner error:", runErr);
 			process.exit(1);

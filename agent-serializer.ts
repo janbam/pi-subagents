@@ -1,12 +1,16 @@
 import * as fs from "node:fs";
-import type { AgentConfig } from "./agents.js";
+import type { AgentConfig } from "./agents.ts";
 
 export const KNOWN_FIELDS = new Set([
 	"name",
 	"description",
 	"tools",
 	"model",
+	"fallbackModels",
 	"thinking",
+	"systemPromptMode",
+	"inheritProjectContext",
+	"inheritSkills",
 	"skill",
 	"skills",
 	"extensions",
@@ -14,6 +18,7 @@ export const KNOWN_FIELDS = new Set([
 	"defaultReads",
 	"defaultProgress",
 	"interactive",
+	"maxSubagentDepth",
 ]);
 
 function joinComma(values: string[] | undefined): string | undefined {
@@ -35,7 +40,12 @@ export function serializeAgent(config: AgentConfig): string {
 	if (toolsValue) lines.push(`tools: ${toolsValue}`);
 
 	if (config.model) lines.push(`model: ${config.model}`);
+	const fallbackModelsValue = joinComma(config.fallbackModels);
+	if (fallbackModelsValue) lines.push(`fallbackModels: ${fallbackModelsValue}`);
 	if (config.thinking && config.thinking !== "off") lines.push(`thinking: ${config.thinking}`);
+	lines.push(`systemPromptMode: ${config.systemPromptMode}`);
+	lines.push(`inheritProjectContext: ${config.inheritProjectContext ? "true" : "false"}`);
+	lines.push(`inheritSkills: ${config.inheritSkills ? "true" : "false"}`);
 
 	const skillsValue = joinComma(config.skills);
 	if (skillsValue) lines.push(`skills: ${skillsValue}`);
@@ -52,6 +62,9 @@ export function serializeAgent(config: AgentConfig): string {
 
 	if (config.defaultProgress) lines.push("defaultProgress: true");
 	if (config.interactive) lines.push("interactive: true");
+	if (Number.isInteger(config.maxSubagentDepth) && config.maxSubagentDepth >= 0) {
+		lines.push(`maxSubagentDepth: ${config.maxSubagentDepth}`);
+	}
 
 	if (config.extraFields) {
 		for (const [key, value] of Object.entries(config.extraFields)) {

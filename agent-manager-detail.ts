@@ -1,12 +1,12 @@
 import type { Theme } from "@mariozechner/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
-import type { AgentConfig } from "./agents.js";
-import { formatDuration } from "./formatters.js";
-import type { RunEntry } from "./run-history.js";
-import { buildSkillInjection, resolveSkills } from "./skills.js";
-import { ensureCursorVisible, getCursorDisplayPos, renderEditor, wrapText } from "./text-editor.js";
-import type { TextEditorState } from "./text-editor.js";
-import { pad, row, renderHeader, renderFooter, formatPath, formatScrollInfo } from "./render-helpers.js";
+import type { AgentConfig } from "./agents.ts";
+import { formatDuration } from "./formatters.ts";
+import type { RunEntry } from "./run-history.ts";
+import { buildSkillInjection, resolveSkills } from "./skills.ts";
+import { ensureCursorVisible, getCursorDisplayPos, renderEditor, wrapText } from "./text-editor.ts";
+import type { TextEditorState } from "./text-editor.ts";
+import { pad, row, renderHeader, renderFooter, formatPath, formatScrollInfo } from "./render-helpers.ts";
 
 export interface DetailState {
 	resolved: boolean;
@@ -27,7 +27,7 @@ function renderFieldLine(
 	width: number,
 	theme: Theme,
 ): string {
-	const labelWidth = 10;
+	const labelWidth = 12;
 	const labelText = theme.fg("dim", pad(label, labelWidth));
 	const available = Math.max(0, width - labelWidth);
 	return `${labelText}${truncateToWidth(value, available)}`;
@@ -58,8 +58,19 @@ function buildDetailLines(
 	const output = agent.output ?? "(none)";
 	const reads = agent.defaultReads && agent.defaultReads.length > 0 ? agent.defaultReads.join(", ") : "(none)";
 	const progress = agent.defaultProgress ? "on" : "off";
+	const maxSubagentDepth = agent.maxSubagentDepth !== undefined ? String(agent.maxSubagentDepth) : "(default)";
 
 	lines.push(renderFieldLine("Model:", agent.model ?? "default", contentWidth, theme));
+	lines.push(renderFieldLine("Prompt mode:", agent.systemPromptMode, contentWidth, theme));
+	lines.push(renderFieldLine("Project ctx:", agent.inheritProjectContext ? "on" : "off", contentWidth, theme));
+	lines.push(renderFieldLine("Skills ctx:", agent.inheritSkills ? "on" : "off", contentWidth, theme));
+	if (agent.source === "builtin") {
+		lines.push(renderFieldLine("Disabled:", agent.disabled ? "on" : "off", contentWidth, theme));
+	}
+	if (agent.override) {
+		const overrideLabel = `${agent.override.scope} · ${formatPath(agent.override.path)}`;
+		lines.push(renderFieldLine("Override:", overrideLabel, contentWidth, theme));
+	}
 	lines.push(renderFieldLine("Thinking:", agent.thinking ?? "off", contentWidth, theme));
 	lines.push(renderFieldLine("Tools:", tools, contentWidth, theme));
 	lines.push(renderFieldLine("MCP:", mcp, contentWidth, theme));
@@ -71,6 +82,7 @@ function buildDetailLines(
 	lines.push(renderFieldLine("Output:", output, contentWidth, theme));
 	lines.push(renderFieldLine("Reads:", reads, contentWidth, theme));
 	lines.push(renderFieldLine("Progress:", progress, contentWidth, theme));
+	lines.push(renderFieldLine("Max depth:", maxSubagentDepth, contentWidth, theme));
 
 	if (agent.extraFields) {
 		for (const [key, value] of Object.entries(agent.extraFields)) {
@@ -100,7 +112,7 @@ function buildDetailLines(
 
 	for (const run of recentRuns) {
 		const when = pad(formatRelativeTime(run.ts), 8);
-		const status = run.status === "ok" ? "✓" : "✗";
+		const status = run.status;
 		const task = truncateToWidth(`"${run.task}"`, 34);
 		const tail = run.status === "ok" ? formatDuration(run.duration) : `exit ${run.exit ?? 1}`;
 		lines.push(truncateToWidth(`  ${when} ${status} ${task} ${tail}`, contentWidth));
@@ -129,7 +141,13 @@ export function renderDetail(
 	theme: Theme,
 ): string[] {
 	const lines: string[] = [];
-	const scopeBadge = agent.source === "builtin" ? "[builtin]" : agent.source === "project" ? "[proj]" : "[user]";
+	const scopeBadge = agent.source === "builtin"
+		? (agent.disabled
+			? (agent.override ? `[builtin off+${agent.override.scope}]` : "[builtin off]")
+			: (agent.override ? `[builtin+${agent.override.scope}]` : "[builtin]"))
+		: agent.source === "project"
+			? "[proj]"
+			: "[user]";
 	const headerText = ` ${agent.name} ${scopeBadge} ${formatPath(agent.filePath)} `;
 	lines.push(renderHeader(headerText, width, theme));
 	lines.push(row("", width, theme));
@@ -150,7 +168,13 @@ export function renderDetail(
 	lines.push(row(scrollInfo ? ` ${theme.fg("dim", scrollInfo)}` : "", width, theme));
 
 	const footer = agent.source === "builtin"
-		? " [l]aunch  [v] raw/resolved  [↑↓] scroll  [esc] back "
+		? agent.override
+			? (agent.disabled
+				? " [e]dit override  [v] raw/resolved  [↑↓] scroll  [esc] back "
+				: " [l]aunch  [e]dit override  [v] raw/resolved  [↑↓] scroll  [esc] back ")
+			: (agent.disabled
+				? " [e]create override  [v] raw/resolved  [↑↓] scroll  [esc] back "
+				: " [l]aunch  [e]create override  [v] raw/resolved  [↑↓] scroll  [esc] back ")
 		: " [l]aunch  [e]dit  [v] raw/resolved  [↑↓] scroll  [esc] back ";
 	lines.push(renderFooter(footer, width, theme));
 	return lines;
