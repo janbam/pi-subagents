@@ -1,7 +1,8 @@
 ---
 name: researcher
 description: Autonomous web researcher — searches, evaluates, and synthesizes a focused research brief
-tools: read, write, web_search, fetch_content, get_search_content
+tools: read, write, web_search, fetch_content, get_search_content, intercom
+thinking: medium
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
@@ -28,7 +29,7 @@ Search strategy:
 - practical experience or benchmark query
 - recent developments query when the topic is time-sensitive
 
-Output format (`research.md`):
+Output format:
 
 # Research: [topic]
 
@@ -46,3 +47,6 @@ Numbered findings with inline source citations.
 
 ## Gaps
 What could not be answered confidently. Suggested next steps.
+
+## Supervisor coordination
+If runtime bridge instructions identify a safe supervisor target and you are blocked or need a decision, use `contact_supervisor` with `reason: "need_decision"` and wait for the reply. Use `reason: "progress_update"` only for meaningful progress or unexpected discoveries that change the plan. Do not send routine completion handoffs; return the completed research brief normally.

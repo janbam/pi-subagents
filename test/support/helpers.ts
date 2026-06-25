@@ -23,6 +23,24 @@ export function removeTempDir(dir: string): void {
 	} catch {}
 }
 
+export function createEventBus() {
+	const listeners = new Map<string, Set<(payload: unknown) => void>>();
+	return {
+		on(channel: string, handler: (payload: unknown) => void) {
+			const channelListeners = listeners.get(channel) ?? new Set();
+			channelListeners.add(handler);
+			listeners.set(channel, channelListeners);
+			return () => {
+				channelListeners.delete(handler);
+				if (channelListeners.size === 0) listeners.delete(channel);
+			};
+		},
+		emit(channel: string, payload: unknown) {
+			for (const handler of listeners.get(channel) ?? []) handler(payload);
+		},
+	};
+}
+
 interface AgentConfig {
 	name: string;
 	description?: string;
@@ -31,6 +49,7 @@ interface AgentConfig {
 	fallbackModels?: string[];
 	tools?: string[];
 	extensions?: string[];
+	subagentOnlyExtensions?: string[];
 	skills?: string[];
 	thinking?: string;
 	systemPromptMode?: string;
@@ -42,6 +61,7 @@ interface AgentConfig {
 	progress?: boolean;
 	mcpDirectTools?: string[];
 	maxSubagentDepth?: number;
+	completionGuard?: boolean;
 }
 
 export function makeAgentConfigs(names: string[]): AgentConfig[] {
@@ -67,7 +87,7 @@ export function makeAgent(name: string, overrides: Partial<AgentConfig> = {}): A
 	};
 }
 
-export interface MinimalCtx {
+interface MinimalCtx {
 	cwd: string;
 	hasUI: boolean;
 	ui: Record<string, never>;
@@ -78,7 +98,7 @@ export interface MinimalCtx {
 	modelRegistry: {
 		getAvailable: () => Array<{ provider: string; id: string }>;
 	};
-	model?: { provider: string };
+	model?: { provider: string; id?: string };
 }
 
 export function makeMinimalCtx(cwd: string): MinimalCtx {
@@ -99,7 +119,7 @@ export function makeMinimalCtx(cwd: string): MinimalCtx {
 /**
  * Try to dynamically import a module.
  * - Bare specifiers are imported as-is.
- * - Relative paths (e.g., "./utils.ts") are resolved from the project root.
+ * - Relative paths (e.g., "./src/shared/utils.ts") are resolved from the project root.
  *
  * Only swallows MODULE_NOT_FOUND / ERR_MODULE_NOT_FOUND when the missing module
  * is exactly the requested bare specifier (expected optional dependency).
