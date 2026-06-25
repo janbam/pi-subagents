@@ -3,11 +3,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export interface MockPiResponse {
+interface MockPiResponse {
 	output?: string;
 	stderr?: string;
 	exitCode?: number;
 	delay?: number;
+	keepAliveAfterFinalMessageMs?: number;
 	jsonl?: unknown[];
 	steps?: Array<{
 		delay?: number;
@@ -15,6 +16,7 @@ export interface MockPiResponse {
 		stderr?: string;
 	}>;
 	echoEnv?: string[];
+	matchArgIncludes?: string | string[];
 }
 
 export interface MockPi {

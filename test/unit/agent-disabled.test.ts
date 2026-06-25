@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { buildBuiltinOverrideConfig, discoverAgents, discoverAgentsAll } from "../../agents.ts";
+import { buildBuiltinOverrideConfig, discoverAgents, discoverAgentsAll } from "../../src/agents/agents.ts";
+import { handleList } from "../../src/agents/agent-management.ts";
 
 let tempHome = "";
 let tempProject = "";
@@ -13,6 +14,14 @@ const originalUserProfile = process.env.USERPROFILE;
 function writeJson(filePath: string, value: unknown): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf-8");
+}
+
+function readText(result: { content: Array<{ type: string; text?: string }> }): string {
+	const first = result.content[0];
+	assert.ok(first);
+	assert.equal(first.type, "text");
+	assert.equal(typeof first.text, "string");
+	return first.text;
 }
 
 describe("builtin agent disabling", () => {
@@ -147,6 +156,32 @@ describe("builtin agent disabling", () => {
 				&& error.message.includes(settingsPath)
 				&& error.message.includes("disableBuiltins"),
 		);
+	});
+
+	it("hides disabled builtins from agent-facing management list output", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { disableBuiltins: true },
+		});
+		const agentsDir = path.join(tempProject, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(agentsDir, "helper.md"),
+			"---\nname: helper\ndescription: Helper\n---\n\nHelp.\n",
+			"utf-8",
+		);
+		const disabledBuiltinNames = discoverAgentsAll(tempProject).builtin.map((agent) => agent.name);
+		assert.ok(disabledBuiltinNames.length > 0);
+
+		const text = readText(handleList(
+			{},
+			{ cwd: tempProject, modelRegistry: { getAvailable: () => [] } },
+		));
+
+		assert.match(text, /Executable agents:\n- helper \(project\): Helper/);
+		assert.doesNotMatch(text, /Disabled builtins:/);
+		for (const name of disabledBuiltinNames) {
+			assert.doesNotMatch(text, new RegExp(`^- ${name} \\(builtin`, "m"));
+		}
 	});
 
 	it("buildBuiltinOverrideConfig emits disabled false when re-enabling a builtin", () => {

@@ -2,6 +2,339 @@
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-06-24
+
+### Added
+- Added `subagents.disableThinking` so bundled builtin agents can drop thinking suffix defaults for providers that do not accept them. Thanks to Joshua Harding (@jhstatewide) for #212.
+- Discover nested grouped skills such as `.pi/skills/group/name/SKILL.md` so subagents match the host runtime's recursive skill lookup. Thanks to Weaxs (@Weaxs) for #262.
+- Follow Pi's configured project config directory for project-local agents, chains, skills, packages, settings, direct MCP config, and intercom package discovery instead of hardcoding `.pi`, while retaining `.pi` as the fallback for older Pi versions.
+
+### Changed
+- Hardened npm installs by tracking `package-lock.json`, pinning direct dependencies, and using `npm ci --ignore-scripts` in CI and release workflows. Thanks to Modestas Vainius (@modax) for #234.
+- List configured subagent skills by name, description, and file path instead of inlining full skill bodies, and ensure tool-restricted children can read those skill files on demand. Thanks to Ruben Paz (@Istar-Eldritch) for #183.
+
+### Fixed
+- Resolve the async result watcher directory with `fs.realpathSync.native()` before `fs.watch()` so Windows profiles with 8.3 temp paths do not crash Pi when async subagent results arrive. Thanks to kerushidao (@kerushidao) for #254.
+- Accept structured acceptance reports emitted in JSON-family fences when the fenced body has the acceptance-report shape. Thanks to Suleiman Tawil (@stawils) for #253.
+- Report field-level acceptance-report validation errors instead of a generic parse failure, and clarify array element types in the acceptance prompt. Thanks to Whisperfall (@Whisperfall) for #264 and josephkEA (@josephkEA) for the follow-up reproduction.
+- Simplified the public `acceptance` and chain tool schemas so Kimi/Moonshot-style parsers can load `subagent`, while runtime validation still rejects malformed acceptance config and dynamic fanout steps. Thanks to Sergio Agosti (@sergio-agosti) for #249.
+- Reject duplicate concurrent `subagent` execution calls while a prior subagent dispatch is still in progress, keeping intentional parallel mode within a single call unchanged. Thanks to desideratum (@desideratum) for #247.
+- Bound async `events.jsonl` growth by dropping noisy child `message_update` snapshots, capping persisted child diagnostics, and scanning control events in chunks during status polling. Thanks to Tri Van Pham (@pvtri96) for #246.
+- Keep crowded async subagent widgets at a stable collapsed height in short terminals, reducing destructive full-screen TUI redraws and flicker. Thanks to ssyram (@ssyram) for #186.
+- Actually wire the previously documented foreground-only `timeoutMs`/`maxRuntimeMs` aliases through single, parallel, chain, and dynamic fanout runs, including stable `timedOut: true` results, preserved partial output, manual-interrupt precedence, and skipped acceptance verification after timeout.
+- Apply `subagents.agentOverrides.<name>` to matching user-scope and project-scope custom agents, while keeping explicit agent frontmatter authoritative per field. Thanks to Jacek Juraszek (@jjuraszek) for #218.
+- Preserve compact foreground `write`/`edit` tool-call evidence in prompt-template delegation responses so convergence checks do not stop loops early. Thanks to Hans Schnedlitz (@hschne) for #207.
+- Respect each agent's `defaultContext` in mixed parallel and chain subagent calls when no explicit `context` is provided, so fresh-default scouts no longer inherit forked parent transcripts just because another agent in the same invocation defaults to fork. Thanks to Mitch Fultz (@fitchmultz) for #228.
+- Make runtime `output` overrides authoritative in child task and system prompts, and remove stale static filenames from bundled output-format instructions. Thanks to youngshine (@smithyyang) for #223.
+- Keep top-level parallel `defaultProgress` files in run-scoped artifact storage instead of the parent working directory. Thanks to youngshine (@smithyyang) for #224.
+
+## [0.30.0] - 2026-06-20
+
+### Added
+- Allow active async chains to accept an `append-step` request that adds one new tail step while the chain is still running.
+- Allow async subagent results to be attached as the root step of a new follow-up chain.
+- Added `subagentOnlyExtensions` so agents can pass selected tool extensions only to spawned subagents without exposing them to the parent agent.
+- Added proactive skill-subagent suggestions to `subagent({ action: "list" })` based on repeatedly configured skill use, while keeping the behavior advisory and opt-out friendly.
+- Added regression coverage for long worker/reviewer chains and parallel -> funnel -> fanout chain flows across foreground and async execution.
+
+### Fixed
+- Interrupt live async children before delivering `resume` follow-up messages so intercom nudges reach workers that are stuck mid-turn more reliably.
+- Reject appended chain steps with duplicate reserved output names or unknown named-output references before they are queued.
+- Ignore legacy `.agents/skills` files during agent discovery so skill definitions are not registered as subagents. Thanks to chyax98 (@chyax98) for #257.
+- Launch detached async runners through Node when Pi itself is not the Node executable. Thanks to Tetsuya.dev (@tetsuya-dev-jp) for #273.
+- Preserve the slash command requester context when bridge requests launch subagents. Thanks to Victor Sumner (@vsumner) for #268.
+- Trim repeated nested `subagent` tool schema descriptions so provider payloads stay compact while retaining top-level parameter guidance. Thanks to Thomas Mustier (@tmustier) for #250.
+
+## [0.29.0] - 2026-06-19
+
+### Added
+- Added package-provided agent and chain discovery from installed Pi packages and package settings, including read-only management behavior, package source counts in doctor output, nested-cwd project package discovery, and package definitions that remain below user/project overrides. Thanks to Fabian Jocks (@iamfj) for #278.
+- Added `PI_SUBAGENT_EXTRA_AGENT_DIRS` and `PI_INTERCOM_EXTENSION_DIR` overrides so bundled agents and `pi-intercom` can be loaded from read-only package locations. Thanks to David Barroso (@dbarrosop) for #288.
+
+### Fixed
+- Show captured output from failed foreground subagents instead of returning only the failure summary. Thanks to Jürgen Schmied (@jschmied) for #277.
+- Preserve nested fanout child subagent history when building child prompts. Thanks to James Wood (@jamesjwood) for the original #270 fix.
+- Retry Windows atomic JSON renames on transient `EPERM`, `EBUSY`, and `EACCES` failures. Thanks to Wings Butterfly (@wings1848) for #269.
+- Inherit the parent session model for subagents instead of falling back to global settings, including foreground, chain, async chain, async single, and resume/revive paths. Thanks to Rogerio Saulo (@rsaulo) for #266 and Nicolas Marchildon (@elecnix) for the original #283 fix.
+- Avoid duplicate `subagent` tool registration in fanout-authorized child processes. Thanks to Aleksei Gurianov (@Guria) for #279.
+- Hardened the parallel intercom integration test fixture after Windows CI exposed nondeterministic failure ordering.
+
+## [0.28.0] - 2026-06-03
+
+### Added
+- Added foreground-only `timeoutMs`/`maxRuntimeMs` for single, parallel, and chain subagent runs. Timed-out children are soft-interrupted, keep completed sibling/prior results, and return `timedOut: true` with a stable timeout message.
+- Added per-agent `maxExecutionTimeMs` and `maxTokens` resource limits. Foreground and async children stop with a clear `resourceLimitExceeded` result when the configured runtime or observed token budget is reached.
+
+### Changed
+- Strengthened tool and skill guidance so writer subagents launched from plans, specs, issues, or broad fixes proactively use structured `acceptance` instead of burying validation requirements only in task prose.
+
+### Fixed
+- Removed a provider-unfriendly required-only subschema from the public `acceptance` tool schema so Kimi models served through OpenCode Go can load the `subagent` tool, while keeping runtime validation for empty acceptance contracts.
+- Clarified acceptance-report prompts so required evidence like `diff-summary` must be copied into structured JSON fields such as `diffSummary`, not only described in visible prose.
+
+## [0.27.0] - 2026-05-30
+
+### Changed
+- Reworked public acceptance config to be object-only and evidence-driven, removing public `level`/disable shorthands. Explicit acceptance now triggers a same-session self-review/repair finalization loop, with `maxFinalizationTurns` controlling the cap.
+- Documented goal-style acceptance guidance so `/goal`, “active goal”, and “work until evidence says done” requests map to run-scoped `acceptance` contracts.
+- Refined acceptance finalization prompts and status output to emphasize evidence, blockers, stop rules, and finalization progress such as `completed after 1/3 turns`.
+
+### Fixed
+- Treat explicit acceptance as the completion contract for acceptance-enabled runs, avoiding implementation completion-guard false positives when the visible output is only an `acceptance-report` or a finalization self-review turn does not need a repair edit.
+
+## [0.26.0] - 2026-05-29
+
+### Added
+- Added first-wave acceptance gates with optional public `acceptance` config, inferred effective policies, structured child reports, provenance ledgers, checked evidence gates, explicit runtime verification commands, async/status persistence, and saved `.chain.json` validation.
+- Added chain step metadata (`phase`, `label`), named outputs (`as` with `{outputs.name}`), workflow graph snapshots, and strict `outputSchema` structured-output contracts across foreground and async chain execution.
+- Added dynamic chain fanout with `expand`/single-template `parallel`/`collect`, structured named-output sources, bounded item expansion, collected result outputs, async status graph persistence, and saved `.chain.json` support.
+
+### Fixed
+- Fixed dynamic fanout acceptance blockers around real `structured_output` tool validation, malformed dynamic-like chain rejection, async dynamic failure status/details, dynamic child intercom target indexing, and saved `.chain.json` management diagnostics.
+- Fixed acceptance-gate semantics so reviewed status requires an independent reviewer result, required criteria must be reported as satisfied, only fenced `acceptance-report` blocks satisfy attestation, malformed reports preserve parse errors, `{ level: "none", reason }` disables inferred gates, and zero-child dynamic aggregates no longer fabricate evidence.
+
+## [0.25.0] - 2026-05-21
+
+### Added
+- Allow child agents whose resolved builtin tools explicitly include `subagent` to run child-safe nested fanout, with parent-visible nested status trees and nested `status`/`interrupt`/`resume` by id.
+
+### Fixed
+- Preserve compact nested child summaries in grouped result/intercom payloads and async completion metadata before ordinary result files are processed and deleted.
+- Keep async result files retryable when nested registry enrichment temporarily fails, instead of marking them seen before a successful delivery pass.
+- Require an explicit id for child-safe nested `status` when no local foreground run is active, preventing fanout children from listing unrelated top-level async runs.
+- Keep fanout child control inbox polling alive across transient filesystem errors, and retain control requests for retry when control-result writes fail.
+- Share nested path/env sanitization between child launch arguments and nested event projection.
+
+## [0.24.4] - 2026-05-20
+
+### Fixed
+- Treat provider-coerced single-run `output: "false"` the same as boolean `false`, preventing literal `false` output files in foreground and async runs.
+- Include selected direct MCP tool names in explicit child `--tools` allowlists when metadata cache/config resolution is available.
+- Honor `PI_CODING_AGENT_DIR` for runtime config, agent/chain/settings discovery, skills, run history, artifact cleanup, and intercom defaults.
+- Hide nested child Pi process windows on Windows for both foreground and background subagent runs.
+- Avoid completion-guard false positives for declared read-only agents, and add `completionGuard: false` for bash-enabled non-implementation agents that should not be required to edit files.
+- Skip empty or whitespace-only assistant text parts when selecting subagent final output, so later meaningful text in the same or earlier assistant message is not masked.
+- Declare `@earendil-works/pi-tui` as a runtime dependency so packaged installs can load the extension without relying on dev dependencies or optional peers.
+- Treat recovered intermediate child tool/provider errors as successful when a later clean final assistant response is emitted, preventing false failed subagent results.
+- Use progress-driven spinner frames in subagent result rows and async widgets, avoiding timer-driven off-screen redraw flicker in small terminals.
+
+## [0.24.3] - 2026-05-14
+
+### Added
+- Show provider-free model and thinking labels in async subagent widgets and status views.
+- Added a packaged `/review-loop` prompt for parent-controlled worker, fresh-reviewer, and fix-worker cycles that can run as an initial async chain or as follow-up subagent runs after async worker completions, stopping when reviewers find no fixes worth doing now or the review-round cap is reached.
+
+### Fixed
+- Let `async: true` chain tool calls run in the background when `clarify` is omitted, and avoid showing the async badge for explicit foreground clarify runs.
+
+## [0.24.2] - 2026-05-10
+
+### Fixed
+- Show the `Ctrl+O` live-detail affordance for running single async subagent widgets when step details are available, while keeping the generic activity fallback before step status arrives.
+
+## [0.24.1] - 2026-05-10
+
+### Changed
+- Migrated Pi package imports and package metadata to the `@earendil-works/*` scope, switched async TypeScript execution discovery to upstream `jiti`, and hardened forked-session creation to use the public `SessionManager.open()` path.
+
+## [0.24.0] - 2026-05-03
+
+### Changed
+- Consolidated async step activity and parallel-outcome formatting used by widgets and `subagent({ action: "status" })` output.
+- Updated `/parallel-review` and `/parallel-cleanup` to end review synthesis with numbered follow-up choices, plus an `autofix` mode for automatically applying fixes worth doing now.
+- Include async run output paths in `subagent({ action: "status" })` output so the remaining inspection path covers the logs previously surfaced by the removed overlay.
+
+### Removed
+- Removed the unnecessary `/agents` manager overlay, its `Ctrl+Shift+A` shortcut, and the `agentManager.newShortcut` setting to cut unnecessary UI surface area; agent and chain management remains available through tool actions, settings, and markdown files.
+- Removed persistent save actions from the chain clarify UI: `S` no longer writes runtime overrides back to agent frontmatter, and `W` no longer saves `.chain.md` files. Clarify now only edits the imminent run.
+- Removed the `/subagents-status` read-only overlay and its slash command; async runs remain inspectable through `subagent({ action: "status" })`, completion notifications, logs, and the async widget.
+- Removed the standalone `src/tui/text-editor.ts`; chain clarify now keeps its small runtime editor logic local to the only remaining consumer.
+
+## [0.23.1] - 2026-05-02
+
+### Added
+- Persist async per-child session metadata and remember recent foreground child session metadata so `resume` can revive multi-child async runs and foreground children by index.
+
+### Fixed
+- Keep foreground children alive when they call `contact_supervisor` for a blocking decision by treating it as intercom coordination during parent detach, matching the generic `intercom` handoff path.
+- Pause foreground parallel and chain flows when a child detaches for intercom coordination instead of counting the child as a successful completed result and continuing the workflow, and suppress grouped completion receipts for detached chains.
+- Tighten resume/revive safety by rejecting pending async children, detached foreground children that may still be live, ambiguous foreground/async id prefixes, and exact invalid resume matches that would otherwise be masked by a prefix match in the other namespace.
+- Preserve child session metadata in stale-run repaired results and avoid advertising revive from top-level-only or missing child session files.
+- Stop builtin `reviewer` runs from writing progress by default, clarify that review-only/no-edit instructions win over progress-writing or artifact-writing instructions, and suppress automatic progress injection for explicit no-edit tasks even when chain templates use `{task}`.
+- Treat parsed provider errors as failed foreground and async subagent attempts even when the child process exits successfully, and baseline saved output files per fallback attempt.
+- Preserve output-file read and inspect errors instead of silently overwriting or falling back when a changed saved-output path cannot be read.
+- Show each active async widget row's lifecycle status (`running`, `complete`, `failed`, or `paused`) alongside activity and usage stats.
+- Start new direct, slash, prompt-template, foreground, and async subagent launches in compact view while keeping `Ctrl+O` available for live detail.
+- Label top-level async parallel completion notifications as parallel runs instead of leaking the internal chain-shaped runner plan.
+
+## [0.23.0] - 2026-05-02
+
+### Fixed
+- Detect `pi-intercom` when installed through the documented `pi install npm:pi-intercom` package flow, instead of only checking the legacy local extension path.
+
+### Changed
+- Store and discover saved chain workflows from dedicated chain directories: user chains in `~/.pi/agent/chains/**/*.chain.md` and project chains in `.pi/chains/**/*.chain.md`.
+- Retry foreground subagent fallback models when Pi reports a retryable provider error, such as 429/quota, even if the child process exits successfully.
+- Align single-run async subagent widgets and `/subagents-status` rendering with foreground subagent result styling for parallel, chain, and grouped chain runs, including inline live detail when tool output expansion is enabled, while keeping multi-job async widgets compact.
+- Render async subagent widgets through an adaptive component so active parallel agent rows fit without Pi's fixed string-widget truncation marker.
+- Tell parent agents that async runs are detached and they should end the turn instead of running sleep/poll loops when no independent work remains.
+
+## [0.22.0] - 2026-05-02
+
+### Added
+- Added child-only supervisor contact support for delegated subagents through `contact_supervisor`, with `need_decision` for blocking supervisor replies and `progress_update` for concise non-blocking updates.
+- Pass supervisor intercom metadata into foreground, chain, parallel, and background child runs so the child-facing pi-intercom tool can resolve the delegating session automatically.
+
+### Changed
+- Builtin agents now inherit the user's configured default model instead of pinning `openai-codex/gpt-5.5`; use builtin overrides to pin a model for a role.
+- Hide unsupported thinking levels in subagent clarify and agent-manager pickers when Pi exposes per-model thinking metadata.
+- Updated builtin agent prompts, README, and bundled skill docs to prefer `contact_supervisor` for blocked decisions and avoid child-side routine completion handoffs.
+- Teach reviewer agents that repo-local `progress.md` files are intentional scratch files that should remain untracked and covered by `.gitignore`.
+
+### Fixed
+- Added regression coverage for supervisor metadata propagation into child process environments.
+
+## [0.21.5] - 2026-05-02
+
+### Fixed
+- Show top-level async parallel runs as `parallel` instead of `chain`, with foreground-style running/done wording in widgets and status output, and group running async chain detail by chain step.
+- Scoped `/subagents-status` to async runs launched from the current pi session instead of showing prior or unrelated sessions.
+- Declared the Pi TUI package as a direct dev dependency and added a manifest guard so CI installs do not rely on transitive optional peer dependencies for tests.
+- Made prompt-runtime extension path assertions portable on Windows.
+
+## [0.21.4] - 2026-05-01
+
+### Added
+- Added explicit frontmatter `package` identifiers for agents and saved chains, registering runtime names like `code-analysis.scout` while preserving separate `name` and `package` fields on save.
+- Added recursive subdirectory discovery for user and project agent and chain definitions.
+- Added `outputMode: "inline" | "file-only"` for saved subagent outputs. `inline` remains the default, while `file-only` returns a concise saved-file reference instead of injecting full saved output back into the parent context.
+
+### Fixed
+- Marked Pi runtime peer dependencies as optional so npm package installs do not auto-install duplicate Pi packages or emit unrelated transitive dependency warnings.
+
+## [0.21.3] - 2026-04-30
+
+### Fixed
+- Debounce foreground `needs_attention` notices, make them non-triggering, and cancel them when the run finishes so stale chain-step alerts do not launch parent turns after completion.
+
+## [0.21.2] - 2026-04-30
+
+### Added
+- Added a packaged `/parallel-context-build` prompt for parallel `context-builder` handoff passes.
+- Added a packaged `/parallel-handoff-plan` prompt for external-reference research plus local `context-builder` passes that produce an implementation handoff meta-prompt.
+
+### Changed
+- Strengthened `context-builder` guidance so handoffs require reading all relevant files and doing needed tool-available research before summarizing.
+- Expanded the bundled `pi-subagents` skill with tool-level recipes for the packaged prompt workflows, including context-build and handoff-plan patterns that parent agents can apply without slash commands.
+- Updated `README.md` to explain the bundled `pi-subagents` skill, what it covers, and how it helps the orchestrating agent.
+
+### Fixed
+- Make active-long-running notices time-based by default, with turn and token thresholds available only as explicit opt-in budget guards.
+- Stop async status listing from inventing `needs_attention` with default thresholds when the runner has not persisted a control state.
+- Treat string `"false"` output settings as disabled output so parallel reviewers do not collide on a `/false` output path, including chain-parallel agent defaults.
+- Wrap long `/subagents-status` detail output/event lines instead of truncating them with ellipses.
+- Treat cleanup after a clean terminal assistant stop as success even when the final assistant text is empty, using a short grace period before terminating lingering child processes without surfacing scary final-drain warnings.
+- Express flexible tool schema fields as `anyOf` unions without parent-level `type` arrays, avoiding schema shapes rejected by strict providers such as Moonshot/opencode-go.
+
+## [0.21.1] - 2026-04-30
+
+### Changed
+- Changed the `/agents` new-agent shortcut from `Alt+N` to `Shift+Ctrl+N`, and added `agentManager.newShortcut` config for overriding it.
+
+### Fixed
+- Fall back to polling async result files when native result watching is unavailable due to `EMFILE` or `ENOSPC`.
+- Treat forced final-drain termination after a valid final assistant output as cleanup success instead of failing the subagent run.
+- Hide disabled builtin agents from `subagent({ action: "list" })` output so agent-facing choices match executable runtime discovery.
+- Resolve intercom bridge default paths at runtime so tests and isolated environments that change `HOME` use the correct `pi-intercom` location.
+- Made the tool-description source check tolerant of Windows line endings.
+
+## [0.21.0] - 2026-04-29
+
+### Changed
+- Document the recommended parent-agent workflow as `clarify → planner → worker → fresh reviewers → worker` in the docs and bundled skill.
+- Packaged `planner`, `worker`, and `oracle` now default to forked session context when the launch omits `context`; explicit `context: "fresh"` still overrides the agent default.
+- Expanded builtin subagent guidance so agents with a safe pi-intercom target can hand results back with blocking `intercom ask`, documented the self-orchestrated clarify → plan → implement → review workflow, and added GPT-5.5-oriented subagent prompt guidance to the bundled skill and `context-builder`.
+
+### Fixed
+- Prevent child subagents from receiving parent orchestration tooling/history, and inject boundary instructions that forbid sub-delegation and pseudo tool calls.
+- Added active-long-running and repeated mutating-tool failure notices so supervised/forked workers cannot burn turns silently while still appearing healthy.
+- Fixed task editor wrapping so wide characters cannot push text past the right border.
+- Mark implementation subagents as failed when they complete without any file mutation attempt.
+- Applied the same no-mutation completion guard to async/background runner paths.
+- Split terminal no-mutation guard notices from live idle notices so completed failures do not suggest status or interrupt commands.
+- Clarified worker/intercom bridge instructions so blocked decisions use `intercom ask` and stay alive for the reply instead of completing with a question.
+- Labeled the Agents widget as async/background work so running detached agents are easier to identify.
+- Reworked parallel progress wording so parallel runs show running/done agent counts (and chain parallel groups show `step X/Y · parallel group` with agent fractions) instead of serial `step X/Y` counters.
+- Expanded `/parallel-cleanup` guidance to flag redundant wrapper tests when one focused regression is enough.
+- Fixed flexible schema validation for `reads` and `skill` overrides so `reads: false`, `skill: "review"`, and `skill: false` no longer trigger `element.reads.every is not a function` (issue #124).
+- Hardened slash-result and async-widget animation timers so stale extension contexts after `/new` or reload stop their timers instead of crashing on `ctx.ui` access (issue #122).
+
+## [0.20.1] - 2026-04-27
+
+### Fixed
+- Made the packaged `/parallel-cleanup` prompt self-contained instead of referencing local-only cleanup skills.
+
+## [0.20.0] - 2026-04-27
+
+### Added
+- Added a packaged `/parallel-cleanup` prompt for focused cleanup review passes.
+
+### Changed
+- Consolidated the `oracle-executor` role into `worker`: `worker` now uses `openai-codex/gpt-5.3-codex` with high thinking and stricter approved-direction guardrails, while `researcher` and `context-builder` now use medium thinking.
+- Updated the bundled `scout` agent model/thinking defaults.
+- Hard-cut over grouped intercom bridge result delivery: with the bridge active, parent-side `pi-subagents` emits one grouped `subagent:result-intercom` message per foreground parent run (single, top-level parallel, or chain) and one per completed async result file. Acknowledged foreground delivery returns a compact receipt instead of duplicating full output in the normal tool result; unacknowledged delivery preserves the normal full output. Grouped messages include child intercom targets and full child summaries.
+
+### Fixed
+- Fixed status and manager row rendering so multiline or tabbed content cannot overflow table rows.
+
+### Removed
+- Removed the bundled `oracle-executor` agent and `/oracle-executor` prompt template in favor of using `worker` for approved oracle handoffs.
+
+## [0.19.3] - 2026-04-27
+
+### Changed
+- Updated the packaged `/parallel-review` prompt so reviewer angles are generated dynamically from the user's intent, plan, implemented code, and current diff, with the listed angles framed as examples rather than fixed defaults.
+
+## [0.19.2] - 2026-04-27
+
+### Added
+- Added packaged prompt templates for common subagent workflows: `/parallel-research`, `/gather-context-and-clarify`, and `/oracle-executor`.
+
+### Changed
+- Tightened the packaged `/parallel-review` prompt so fresh-context reviewers get distinct angles and return evidence-backed findings.
+- Refreshed the packaged `pi-subagents` skill with doctor diagnostics, saved-chain launches, prompt shortcuts, builtin overrides, intercom bridge guidance, fresh-context review defaults, and parallel task behavior.
+- Reworked the README around plain-language usage, good first prompts, packaged prompt shortcuts, builtin agent guidance, intercom setup, model overrides, and optional reference material.
+
+## [0.19.1] - 2026-04-26
+
+### Added
+- Added `subagent({ action: "doctor" })` and `/subagents-doctor` for read-only subagent environment diagnostics.
+- Added `/run-chain` to launch saved `.chain.md` workflows directly from slash commands with completion, shared task input, and `--bg`/`--fork` support.
+
+## [0.19.0] - 2026-04-26
+
+### Added
+- Added top-level parallel task support for per-task `output`, `reads`, and `progress`, including `/parallel` inline forwarding and async preservation.
+- Added `/agents` launch toggles for forked context, background execution, and worktree-isolated parallel runs.
+- Added a read-only detail view to `/subagents-status` for inspecting selected async runs, including recent events, output tails, and useful run paths.
+- Added a packaged `/parallel-review` prompt template for launching fresh-context adversarial review subagents.
+
+### Fixed
+- Parallel and chain child runs now detach cleanly when a child uses intercom, preventing incoming handoff messages from aborting the parent foreground run.
+
+## [0.18.1] - 2026-04-25
+
+### Changed
+- Restyled live subagent rendering, async widgets, and background completion notifications with compact Claude-style visual grammar while preserving existing observability paths.
+- Parallel subagent result rendering now labels parallel workers as `Agent N` instead of `Step N`, while chain rendering keeps step terminology.
+
+### Fixed
+- `/run` and single-agent tool calls now allow self-contained agents to run without a task string.
+- The `subagent` tool description no longer advertises hardcoded builtin agent names and management list output now separates disabled builtins from executable agents.
+- Flexible `subagent` tool schema fields now include explicit JSON Schema types so llama.cpp and local OpenAI-compatible providers accept them.
+- Settings package sources now resolve explicit `git:` and `npm:` entries from project and user package caches.
+- Slash-command subagent results are now export-friendly, including completed output and child session paths in visible export content.
+
 ## [0.18.0] - 2026-04-23
 
 ### Added

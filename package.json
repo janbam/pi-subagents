@@ -1,6 +1,6 @@
 {
   "name": "pi-subagents",
-  "version": "0.18.0",
+  "version": "0.31.0",
   "description": "Pi extension for delegating tasks to subagents with chains, parallel execution, and TUI clarification",
   "author": "Nico Bailon",
   "license": "MIT",
@@ -26,11 +26,11 @@
     "pi-subagents": "install.mjs"
   },
   "files": [
-    "*.ts",
-    "!*.test.ts",
+    "src/**/*.ts",
     "*.mjs",
     "agents/",
     "skills/**/*",
+    "prompts/**/*",
     "README.md",
     "CHANGELOG.md"
   ],
@@ -42,24 +42,39 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./src/extension/index.ts"
     ],
     "skills": [
       "./skills"
+    ],
+    "prompts": [
+      "./prompts"
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "0.74.0",
+    "jiti": "2.7.0",
+    "typebox": "1.1.24"
   },
   "devDependencies": {
-    "@mariozechner/pi-agent-core": "^0.70.2",
-    "@mariozechner/pi-ai": "^0.70.2",
-    "@mariozechner/pi-coding-agent": "^0.70.2",
-    "@mariozechner/pi-tui": "^0.70.2",
-    "typebox": "^1.1.24"
+    "@earendil-works/pi-agent-core": "0.74.0",
+    "@earendil-works/pi-ai": "0.74.0",
+    "@earendil-works/pi-coding-agent": "0.74.0"
   }
 }

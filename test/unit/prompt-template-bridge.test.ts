@@ -9,7 +9,7 @@ import {
 	PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT,
 	registerPromptTemplateDelegationBridge,
 	type PromptTemplateBridgeEvents,
-} from "../../prompt-template-bridge.ts";
+} from "../../src/slash/prompt-template-bridge.ts";
 
 class FakeEvents implements PromptTemplateBridgeEvents {
 	private handlers = new Map<string, Array<(data: unknown) => void>>();
@@ -55,9 +55,9 @@ describe("prompt-template delegation bridge", () => {
 							index: 0,
 							agent: "worker",
 							currentTool: "read",
-							currentToolArgs: "index.ts",
+							currentToolArgs: "src/extension/index.ts",
 							recentOutput: ["line 1"],
-							recentTools: [{ tool: "read", args: '{"path":"index.ts"}' }],
+							recentTools: [{ tool: "read", args: '{"path":"src/extension/index.ts"}' }],
 							toolCount: 1,
 							durationMs: 10,
 							tokens: 42,
@@ -101,7 +101,7 @@ describe("prompt-template delegation bridge", () => {
 		assert.equal(update.currentTool, "read");
 		assert.equal(update.toolCount, 1);
 		assert.deepEqual(update.recentOutputLines, ["line 1"]);
-		assert.deepEqual(update.recentTools, [{ tool: "read", args: '{"path":"index.ts"}' }]);
+		assert.deepEqual(update.recentTools, [{ tool: "read", args: '{"path":"src/extension/index.ts"}' }]);
 		assert.equal(update.model, "openai/gpt-5-mini");
 		assert.equal(update.taskProgress?.[0]?.model, "openai/gpt-5-mini");
 
@@ -110,6 +110,46 @@ describe("prompt-template delegation bridge", () => {
 		assert.equal(response.isError, false);
 		assert.equal(Array.isArray(response.messages), true);
 		assert.equal(executeCalls, 1);
+
+		bridge.dispose();
+	});
+
+	it("rebuilds compact tool-call summaries into delegated response messages", async () => {
+		const events = new FakeEvents();
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => ({
+				details: {
+					results: [{
+						finalOutput: "finished",
+						toolCalls: [
+							{ text: "write src/output.md", expandedText: "write src/output.md" },
+							{ text: "edit src/output.md", expandedText: "edit src/output.md" },
+						],
+					}],
+				},
+			}),
+		});
+
+		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, {
+			requestId: "r-compact-tools",
+			agent: "worker",
+			task: "do work",
+			context: "fresh",
+			model: "openai/gpt-5",
+			cwd: "/repo",
+		});
+
+		const response = await responsePromise as { messages: Array<{ role?: string; content?: Array<{ type?: string; name?: string; text?: string }> }> };
+		assert.equal(response.messages.length, 1);
+		assert.equal(response.messages[0]?.role, "assistant");
+		assert.deepEqual(
+			response.messages[0]?.content?.filter((part) => part.type === "toolCall").map((part) => part.name),
+			["write", "edit"],
+		);
+		assert.equal(response.messages[0]?.content?.some((part) => part.type === "text" && part.text === "finished"), true);
 
 		bridge.dispose();
 	});
